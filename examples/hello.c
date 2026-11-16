@@ -7,6 +7,10 @@
 int
 main(void)
 {
+#ifdef __CPM80__
+    printf("Hello, world, from clang on CP/M-80!\n");
+#else
     printf("Hello, world, from clang on CP/M-86!\n");
+#endif
     return 0;
 }

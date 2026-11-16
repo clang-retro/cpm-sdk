@@ -1,0 +1,2821 @@
+// 8080 and Z80 emulator.
+// Written by David Lee
+// useful:  https://pastraiser.com/cpu/i8080/i8080_opcodes.html
+//          https://altairclone.com/downloads/manuals/8080%20Programmers%20Manual.pdf
+//          http://popolony2k.com.br/xtras/programming/asm/nemesis-lonestar/8080-z80-instruction-set.html
+//          https://www.zilog.com/docs/z80/um0080.pdf
+//          http://www.z80.info/z80time.txt
+//          http://www.z80.info/zip/z80-documented.pdf
+//          http://www.z80.info/z80undoc.htm
+//          http://www.z80.info/z80sflag.htm
+//          http://www.righto.com/2012/12/the-6502-overflow-flag-explained.html
+//          https://mdfs.net/Software/Z80/Exerciser/
+//          https://onlinedisassembler.com/odaweb/
+// symbols that start with z80_ are (unsurprisingly) Z80-specific. 80% of this code is Z80-specific.
+// 8080 emulation would be >20% faster if not for the z80 checks
+// Validated 100% pass for 8080 with 8080ex1.com, 8080pre.com, Microcosm v1.0, and cputest.com Diagnostics II V1.2 in 8080 mode.
+// Validated 100% pass for Z80 with zexall.com, zexdoc.com, and cputest.com in Z80 mode.
+
+#include <stdio.h>
+#include <memory.h>
+#include <assert.h>
+#include <cstdlib>
+#include <vector>
+#include <cstring>
+#include <bitset>
+#include <djl_os.hxx>
+#include <djltrace.hxx>
+
+using namespace std;
+
+#include "x80.hxx"
+
+uint8_t memory[ 65536 ];
+registers reg;
+static const char * reg_strings[ 8 ] = { "b", "c", "d", "e", "h", "l", "m", "a" };
+static const char * rp_strings[ 4 ] = { "bc", "de", "hl", "sp" };
+static const char * z80_math_strings[ 8 ] = { "add", "adc", "sub", "sbb", "and", "xor", "or", "cp" };
+static const char * z80_rotate_strings[ 8 ] = { "rlc", "rrc", "rl", "rr", "sla", "sra", "sll", "srl" };
+static uint8_t g_State = 0;
+const uint8_t stateTraceInstructions = 1;
+const uint8_t stateEndEmulation = 2;
+const uint8_t stateProfile = 4;
+void x80_trace_instructions( bool t ) { if ( t ) g_State |= stateTraceInstructions; else g_State &= ~stateTraceInstructions; }
+void x80_end_emulation() { g_State |= stateEndEmulation; }
+
+// Optional per-PC execution profiler. Kept behind the existing g_State gate so
+// the instruction loop still has one check for all optional per-instruction work.
+// Weighted by cycles rather than raw execution count (see handle_state()) so a
+// 23-cycle "call" doesn't count the same as a 4-cycle "inc hl".
+static uint64_t * g_pcHits = 0;
+static uint16_t g_profileLastPC = 0;
+static uint32_t g_profileLastCycles = 0;
+void x80_profile_enable( bool enable )
+{
+#ifndef WATCOMDOS
+    if ( enable && 0 == g_pcHits )
+        g_pcHits = (uint64_t *) calloc( 65536, sizeof( uint64_t ) );
+    if ( enable && ( 0 != g_pcHits ) )
+    {
+        g_State |= stateProfile;
+        g_profileLastPC = 0;
+        g_profileLastCycles = 0;
+    }
+    else
+        g_State &= ~stateProfile;
+#endif
+} //x80_profile_enable
+
+const uint64_t * x80_profile_counts( void ) { return ( g_State & stateProfile ) ? g_pcHits : 0; }
+
+enum z80_value_source { vs_register, vs_memory, vs_indexed }; // this impacts how Z80 undocumented Y and X flags are updated
+const uint8_t cyclesnt = 6;  // cycles subtracted when a conditional return isn't taken (both modes), or a conditional call isn't taken on 8080 (Z80 call subtracts 7 instead). Conditional jp/jmp costs the same either way -- no subtraction.
+
+// instructions starting with '*' are undocumented for 8080, and not implemented here. They also signal likely Z80 instructions
+static const char i8080_instructions[ 256 ][ 16 ] =
+{
+    /*00*/  "nop",      "lxi b, d16",  "stax b",   "inx b",      "inr b",    "dcr b",     "mvi b, d8", "rlc",
+    /*08*/  "*nop",     "dad b",       "ldax b",   "dcx b",      "inr c",    "dcr c",     "mvi c, d8", "rrc",
+    /*10*/  "*nop",     "lxi d, d16",  "stax d",   "inx d",      "inr d",    "dcr d",     "mvi d, d8", "ral",
+    /*18*/  "*nop",     "dad d",       "ldax d",   "dcx d",      "inr e",    "dcr e",     "mvi e, d8", "rar",
+    /*20*/  "*nop",     "lxi h, d16",  "shld a16", "inx h",      "inr h",    "dcr h",     "mvi h, d8", "daa",
+    /*28*/  "*nop",     "dad h",       "lhld a16", "dcx h",      "inr l",    "dcr l",     "mvi l, d8", "cma",
+    /*30*/  "*nop",     "lxi sp, d16", "sta a16",  "inx sp",     "inr m",    "dcr m",     "mvi m, d8", "stc",
+    /*38*/  "*nop",     "dad sp",      "lda a16",  "dcx sp",     "inr a",    "dcr a",     "mvi a, d8", "cmc",
+    /*40*/  "mov b, b", "mov b, c",    "mov b, d", "mov b, e",   "mov b, h", "mov b, l",  "mov b, m",  "mov b, a",
+    /*48*/  "mov c, b", "mov c, c",    "mov c, d", "mov c, e",   "mov c, h", "mov c, l",  "mov c, m",  "mov c, a",
+    /*50*/  "mov d, b", "mov d, c",    "mov d, d", "mov d, e",   "mov d, h", "mov d, l",  "mov d, m",  "mov d, a",
+    /*58*/  "mov e, b", "mov e, c",    "mov e, d", "mov e, e",   "mov e, h", "mov e, l",  "mov e, m",  "mov e, a",
+    /*60*/  "mov h, b", "mov h, c",    "mov h, d", "mov h, e",   "(hook)",   "mov h, l",  "mov h, m",  "mov h, a",
+    /*68*/  "mov l, b", "mov l, c",    "mov l, d", "mov l, e",   "mov l, h", "mov l, l",  "mov l, m",  "mov l, a",
+    /*70*/  "mov m, b", "mov m, c",    "mov m, d", "mov m, e",   "mov m, h", "mov m, l",  "hlt",       "mov m, a",
+    /*78*/  "mov a, b", "mov a, c",    "mov a, d", "mov a, e",   "mov a, h", "mov a, l",  "mov a, m",  "mov a, a",
+    /*80*/  "add b",    "add c",       "add d",    "add e",      "add h",    "add l",     "add m",     "add a",
+    /*88*/  "adc b",    "adc c",       "adc d",    "adc e",      "adc h",    "adc l",     "adc m",     "adc a",
+    /*90*/  "sub b",    "sub c",       "sub d",    "sub e",      "sub h",    "sub l",     "sub m",     "sub a",
+    /*98*/  "sbb b",    "sbb c",       "sbb d",    "sbb e",      "sbb h",    "sbb l",     "sbb m",     "sbb a",
+    /*a0*/  "ana b",    "ana c",       "ana d",    "ana e",      "ana h",    "ana l",     "ana m",     "ana a",
+    /*a8*/  "xra b",    "xra c",       "xra d",    "xra e",      "xra h",    "xra l",     "xra m",     "xra a",
+    /*b0*/  "ora b",    "ora c",       "ora d",    "ora e",      "ora h",    "ora l",     "ora m",     "ora a",
+    /*b8*/  "cmp b",    "cmp c",       "cmp d",    "cmp e",      "cmp h",    "cmp l",     "cmp m",     "cmp a",
+    /*c0*/  "rnz",      "pop b",       "jnz a16",  "jmp a16",    "cnz a16",  "push b",    "adi d8",    "rst 0",
+    /*c8*/  "rz",       "ret",         "jz a16",   "*jmp",       "cz a16",   "call a16",  "aci d8",    "rst 1",
+    /*d0*/  "rnc",      "pop d",       "jnc a16",  "out d8",     "cnc a16",  "push d",    "sui d8",    "rst 2",
+    /*d8*/  "rc",       "*ret",        "jc a16",   "in d8",      "cc a16",   "*call a16", "sbi d8",    "rst 3",
+    /*e0*/  "rpo",      "pop h",       "jpo a16",  "xthl",       "cpo a16",  "push h",    "ani d8",    "rst 4",
+    /*e8*/  "rpe",      "pchl",        "jpe a16",  "xchg",       "cpe a16",  "*call a16", "xri d8",    "rst 5",
+    /*f0*/  "rp",       "pop psw",     "jp a16",   "di",         "cp a16",   "push psw",  "ori d8",    "rst 6",
+    /*f8*/  "rm",       "sphl",        "jm a16",   "ei",         "cm a16",   "*call a16", "cpi d8",    "rst 7",
+};
+
+// instructions starting with '*' are Z80-specific, generally multi-byte, and handled separately.
+// instructions listed here are the overlap with 8080 but with the Z80 naming.
+static const char z80_instructions[ 256 ][ 16 ] =
+{
+    /*00*/ "nop",        "ld bc, d16", "ld (bc), a",   "inc bc",      "inc b",        "dec b",      "ld b, d8",    "rlca",
+    /*08*/ "*'",         "add hl, bc", "ld a, (bc)",   "dec bc",      "inc c",        "dec c",      "ld c, d8",    "rrca",
+    /*10*/ "*",          "ld de, d16", "ld (de), a",   "inc de",      "inc d",        "dec d",      "ld d, d8",    "rla",
+    /*18*/ "*",          "add hl, de", "ld a, (de)",   "dec de",      "inc e",        "dec e",      "ld e, d8",    "rra",
+    /*20*/ "*",          "ld hl, d16", "ld (a16), hl", "inc hl",      "inc h",        "dec h",      "ld h, d8",    "daa",
+    /*28*/ "*",          "add hl, hl", "ld hl, (a16)", "dec hl",      "inc l",        "dec l",      "ld l, d8",    "cpl",
+    /*30*/ "*",          "ld sp, d16", "ld (a16), a",  "inc sp",      "inc (hl)",     "dec (hl)",   "ld (hl), d8", "scf",
+    /*38*/ "*",          "add hl, sp", "ld a, (a16)",  "dec sp",      "inc a",        "dec a",      "ld a, d8",    "ccf",
+    /*40*/ "ld b, b",    "ld b, c",    "ld b, d",      "ld b, e",     "ld b, h",      "ld b, l",    "ld b, (hl)",  "ld b, a",
+    /*48*/ "ld c, b",    "ld c, c",    "ld c, d",      "ld c, e",     "ld c, h",      "ld c, l",    "ld c, (hl)",  "ld c, a",
+    /*50*/ "ld d, b",    "ld d, c",    "ld d, d",      "ld d, e",     "ld d, h",      "ld d, l",    "ld d, (hl)",  "ld d, a",
+    /*58*/ "ld e, b",    "ld e, c",    "ld e, d",      "ld e, e",     "ld e, h",      "ld e, l",    "ld e, (hl)",  "ld e, a",
+    /*60*/ "ld h, b",    "ld h, c",    "ld h, d",      "ld h, e",     "(hook)",       "ld h, l",    "ld h, (hl)",  "ld h, a",
+    /*68*/ "ld l, b",    "ld l, c",    "ld l, d",      "ld l, e",     "ld l, h",      "ld l, l",    "ld l, (hl)",  "ld l, a",
+    /*70*/ "ld (hl), b", "ld (hl), c", "ld (hl), d",   "ld (hl), e",  "ld (hl), h",   "ld (hl), l", "halt",        "ld (hl), a",
+    /*78*/ "ld a, b",    "ld a, c",    "ld a, d",      "ld a, e",     "ld a, h",      "ld a, l",    "ld a, (hl)",  "ld a, a",
+    /*80*/ "add a, b",   "add a, c",   "add a, d",     "add a, e",    "add a, h",     "add a, l",   "add a, (hl)", "add a, a",
+    /*88*/ "adc a, b",   "adc a, c",   "adc a, d",     "adc a, e",    "adc a, h",     "adc a, l",   "adc a, (hl)", "adc a, a",
+    /*90*/ "sub b",      "sub c",      "sub d",        "sub e",       "sub h",        "sub l",      "sub (hl)",    "sub a",
+    /*98*/ "sbc a, b",   "sbc a, c",   "sbc a, d",     "sbc a, e",    "sbc a, h",     "sbc a, l",   "sbc a, (hl)", "sbc a, a",
+    /*a0*/ "and b",      "and c",      "and d",        "and e",       "and h",        "and l",      "and (hl)",    "and a",
+    /*a8*/ "xor b",      "xor c",      "xor d",        "xor e",       "xor h",        "xor l",      "xor (hl)",    "xor a",
+    /*b0*/ "or b",       "or c",       "or d",         "or e",        "or h",         "or l",       "or (hl)",     "or a",
+    /*b8*/ "cp b",       "cp c",       "cp d",         "cp e",        "cp h",         "cp l",       "cp (hl)",     "cp a",
+    /*c0*/ "ret nz",     "pop bc",     "jp nz, a16",   "jp a16",      "call nz, a16", "push bc",    "add a, d8",   "rst 0",
+    /*c8*/ "ret z",      "ret",        "jp z, a16",    "*",           "call z, a16",  "call a16",   "adc a, d8",   "rst 1",
+    /*d0*/ "ret nc",     "pop de",     "jp nc, a16",   "out (d8), a", "call nc, a16", "push de",    "sub d8",      "rst 2",
+    /*d8*/ "ret c",      "*",          "jp c, a16",    "in a, (d8)",  "call c, a16",  "*",          "sbc d8",      "rst 3",
+    /*e0*/ "ret po",     "pop hl",     "jp po, a16",   "ex (sp), hl", "call po, a16", "push hl",    "and d8",      "rst 4",
+    /*e8*/ "ret pe",     "jp (hl)",    "jp pe, a16",   "ex de, hl",   "call pe, a16", "*",          "xor d8",      "rst 5",
+    /*f0*/ "ret p",      "pop af",     "jp p, a16",    "di",          "call p, a16",  "push af",    "or d8",       "rst 6",
+    /*f8*/ "ret m",      "ld sp, hl",  "jp m, a16",    "ei",          "call m, a16",  "*",          "cp d8",       "rst 7",
+};
+
+// base cycles. 8080 conditional calls take 11 (not 17) if not taken. conditional returns take 5 (not 11) if not taken.
+typedef uint8_t acycles_t[ 256 ];
+static const acycles_t i8080_cycles =
+{
+    /*00*/  4, 10,  7,  5,  5,  5,  7,  4,    4, 10,  7,  5,  5,  5,  7,  4,
+    /*10*/  4, 10,  7,  5,  5,  5,  7,  4,    4, 10,  7,  5,  5,  5,  7,  4,
+    /*20*/  4, 10, 16,  5,  5,  5,  7,  4,    4, 10, 16,  5,  5,  5,  7,  4,
+    /*30*/  4, 10, 13,  5, 10, 10, 10,  4,    4, 10, 13,  5,  5,  5,  7,  4,
+    /*40*/  5,  5,  5,  5,  5,  5,  7,  5,    5,  5,  5,  5,  5,  5,  7,  5,
+    /*50*/  5,  5,  5,  5,  5,  5,  7,  5,    5,  5,  5,  5,  5,  5,  7,  5,
+    /*60*/  5,  5,  5,  5,  0,  5,  7,  5,    5,  5,  5,  5,  5,  5,  7,  5,
+    /*70*/  7,  7,  7,  7,  7,  7,  7,  7,    5,  5,  5,  5,  5,  5,  7,  5,
+    /*80*/  4,  4,  4,  4,  4,  4,  7,  4,    4,  4,  4,  4,  4,  4,  7,  4,
+    /*90*/  4,  4,  4,  4,  4,  4,  7,  4,    4,  4,  4,  4,  4,  4,  7,  4,
+    /*a0*/  4,  4,  4,  4,  4,  4,  7,  4,    4,  4,  4,  4,  4,  4,  7,  4,
+    /*b0*/  4,  4,  4,  4,  4,  4,  7,  4,    4,  4,  4,  4,  4,  4,  7,  4,
+    /*c0*/ 11, 10, 10, 10, 17, 11,  7, 11,   11, 10, 10, 10, 17, 17,  7, 11,
+    /*d0*/ 11, 10, 10, 10, 17, 11,  7, 11,   11, 10, 10, 10, 17, 17,  7, 11,
+    /*e0*/ 11, 10, 10, 18, 17, 11,  7, 11,   11,  5, 10,  4, 17, 17,  7, 11,
+    /*f0*/ 11, 10, 10,  4, 17, 11,  7, 11,   11,  5, 10,  4, 17, 17,  7, 11,
+};
+
+static const acycles_t z80_cycles =
+{
+    /*00*/  4, 10,  7,  6,  4,  4,  7,  4,    0, 11,  7,  6,  4,  4,  7,  4,
+    /*10*/  0, 10,  7,  6,  4,  4,  7,  4,    0, 11,  7,  6,  4,  4,  7,  4,
+    /*20*/  0, 10, 16,  6,  4,  4,  7,  4,    0, 11, 16,  6,  4,  4,  7,  4,
+    /*30*/  0, 10, 13,  6, 11, 11, 10,  4,    0, 11, 13,  6,  4,  4,  7,  4,
+    /*40*/  4,  4,  4,  4,  4,  4,  7,  4,    4,  4,  4,  4,  4,  4,  7,  4,
+    /*50*/  4,  4,  4,  4,  4,  4,  7,  4,    4,  4,  4,  4,  4,  4,  7,  4,
+    /*60*/  4,  4,  4,  4,  0,  4,  7,  4,    4,  4,  4,  4,  4,  4,  7,  4,
+    /*70*/  7,  7,  7,  7,  7,  7,  4,  7,    4,  4,  4,  4,  4,  4,  7,  4,
+    /*80*/  4,  4,  4,  4,  4,  4,  7,  4,    4,  4,  4,  4,  4,  4,  7,  4,
+    /*90*/  4,  4,  4,  4,  4,  4,  7,  4,    4,  4,  4,  4,  4,  4,  7,  4,
+    /*a0*/  4,  4,  4,  4,  4,  4,  7,  4,    4,  4,  4,  4,  4,  4,  7,  4,
+    /*b0*/  4,  4,  4,  4,  4,  4,  7,  4,    4,  4,  4,  4,  4,  4,  7,  4,
+    /*c0*/ 11, 10, 10, 10, 17, 11,  7, 11,   11, 10, 10,  0, 17, 17,  7, 11,
+    /*d0*/ 11, 10, 10, 11, 17, 11,  7, 11,   11,  0, 10, 11, 17,  0,  7, 11,
+    /*e0*/ 11, 10, 10, 19, 17, 11,  7, 11,   11,  4, 10,  4, 17,  0,  7, 11,
+    /*f0*/ 11, 10, 10,  4, 17, 11,  7, 11,   11,  6, 10,  4, 17,  0,  7, 11,
+};
+
+#ifdef TARGET_BIG_ENDIAN
+static uint16_t mword( uint16_t offset ) { return flip_endian16( * ( (uint16_t *) & memory[ offset ] ) ); }
+static void setmword( uint16_t offset, uint16_t value ) { * (uint16_t *) & memory[ offset ] = flip_endian16( value ); }
+#else
+static uint16_t mword( uint16_t offset ) { return * ( (uint16_t *) & memory[ offset ] ); }
+static void setmword( uint16_t offset, uint16_t value ) { * (uint16_t *) & memory[ offset ] = value; }
+#endif
+
+// pc/sp are passed by reference rather than read/written through reg.pc/reg.sp: callers
+// (x80_emulate_impl's main switch, z80_emulate) keep them in host-register-resident locals
+// for their duration, avoiding a memory round trip through reg.pc/reg.sp on every fetch/
+// jump/call/push/pop - by far the most frequently touched pieces of CPU state.
+static inline uint8_t pcbyte( uint16_t & pc ) { return memory[ pc++ ]; }
+static inline uint16_t pcword( uint16_t & pc ) { uint16_t r = mword( pc ); pc += 2; return r; }
+static inline void pushword( uint16_t & sp, uint16_t val ) { sp -= 2; setmword( sp, val ); }
+static inline uint16_t popword( uint16_t & sp ) { uint16_t val = mword( sp ); sp += 2; return val; }
+
+void set_parity( uint8_t x ) { reg.fParityEven_Overflow = is_parity_even8( x ); }
+
+void set_sign_zero( uint8_t x )
+{
+    reg.fSign = ( 0 != ( 0x80 & x ) );
+    reg.fZero = ( 0 == x );
+} //set_sign_zero
+
+void set_sign_zero_parity( uint8_t x )
+{
+    set_sign_zero( x );
+    set_parity( x );
+} //set_sign_zero_parity
+
+void z80_set_sign_zero_16( uint16_t x )
+{
+    reg.fSign = ( 0 != ( 0x8000 & x ) );
+    reg.fZero = ( 0 == x );
+} //z80_set_sign_zero_16
+
+template <bool Z80Mode> force_inlined uint8_t op_inc( uint8_t x )
+{
+    x++;
+    reg.fAuxCarry = ( 0 == ( x & 0xf ) );
+    set_sign_zero( x );
+
+    if ( Z80Mode )
+    {
+        reg.fParityEven_Overflow = ( x == 0x80 );
+        reg.fWasSubtract = false;
+        reg.z80_assignYX( x );
+    }
+    else
+        set_parity( x );
+    return x;
+} //op_inc
+
+template <bool Z80Mode> force_inlined uint8_t op_dec( uint8_t x )
+{
+    uint8_t result = x - 1;
+    set_sign_zero( result );
+
+    if ( Z80Mode )
+    {
+        reg.fParityEven_Overflow = ( x == 0x80 );
+        reg.fWasSubtract = true;
+
+        // Aux / Half carry returns the opposite value on Z80 as on 8080
+        reg.fAuxCarry = ( 0xf == ( result & 0xf ) );
+        reg.z80_assignYX( result );
+    }
+    else
+    {
+        set_parity( result );
+        reg.fAuxCarry = ( 0xf != ( result & 0xf ) );
+    }
+
+    return result;
+} //op_dec
+
+template <bool Z80Mode> force_inlined void op_add( uint8_t x, bool carry = false )
+{
+    uint16_t carry_int = carry ? 1 : 0;
+    uint16_t r16 = (uint16_t) reg.a + (uint16_t) x + carry_int;
+    uint8_t r8 = r16 & 0xff;
+    reg.fCarry = ( 0 != ( r16 & 0x0100 ) );
+
+    // low nibble add + carry overflows to high nibble
+
+    reg.fAuxCarry = ( 0 != ( ( ( 0xf & reg.a ) + ( 0xf & x ) + carry_int ) & 0x10 ) );
+    set_sign_zero( r8 );
+
+    // if ( not ( one of lhs and rhs are negative ) ) and ( one of lhs and result are negative )
+
+    if ( Z80Mode )
+    {
+        reg.fParityEven_Overflow = ( ! ( ( reg.a ^ x ) & 0x80 ) ) && ( ( reg.a ^ r8 ) & 0x80 );
+        reg.fWasSubtract = false;
+        reg.z80_assignYX( r8 );
+    }
+    else
+        set_parity( r8 );
+
+    reg.a = r8;
+} //op_add
+
+template <bool Z80Mode> void op_adc( uint8_t x )
+{
+    op_add<Z80Mode>( x, reg.fCarry );
+} //op_adc
+
+template <bool Z80Mode> force_inlined uint8_t op_sub( uint8_t x, bool borrow = false )
+{
+    uint8_t borrow_in = borrow ? 1 : 0;
+    uint16_t res16 = (uint16_t) reg.a - (uint16_t) x - (uint16_t) borrow_in;
+    uint8_t res8 = res16 & 0xff;
+    reg.fCarry = ( 0 != ( res16 & 0x100 ) ); // set means a borrow was needed
+    set_sign_zero( res8 );
+    reg.fAuxCarry = ( ( reg.a & 0xf ) >= ( ( x & 0xf ) + borrow_in ) ); // set means no borrow from the low nibble
+
+    if ( Z80Mode )
+    {
+        // if ( one of lhs and rhs are negative ) and ( one of lhs and result are negative )
+
+        reg.fParityEven_Overflow = ( ( reg.a ^ x ) & 0x80 ) && ( ( reg.a ^ res8 ) & 0x80 );
+        reg.fWasSubtract = true;
+        reg.fAuxCarry = !reg.fAuxCarry; // opposite meaning on z80 for subtract
+        reg.z80_assignYX( res8 );
+    }
+    else
+        set_parity( res8 );
+
+    // op_sub is the only op_X that doesn't update reg.a because it's also used for op_cmp
+    return res8;
+} //op_sub
+
+template <bool Z80Mode> force_inlined void op_sbb( uint8_t x )
+{
+    reg.a = op_sub<Z80Mode>( x, reg.fCarry );
+} //op_sbb
+
+template <bool Z80Mode> force_inlined void op_cmp( uint8_t x )
+{
+    op_sub<Z80Mode>( x, false );
+    if ( Z80Mode )
+        reg.z80_assignYX( x ); // done on operand, not the result or reg.a
+} //op_cmp
+
+template <bool Z80Mode> force_inlined void op_ana( uint8_t x )
+{
+    reg.fAuxCarry = ( 0 != ( 0x8 & ( reg.a | x ) ) ); // documented for 8080, not true for 8085
+    reg.fCarry = false;
+    reg.a &= x;
+    set_sign_zero_parity( reg.a );
+
+    if ( Z80Mode )
+    {
+        reg.fWasSubtract = false;
+        reg.fAuxCarry = true;
+        reg.z80_assignYX( reg.a );
+    }
+} //op_ana
+
+template <bool Z80Mode> force_inlined void op_ora( uint8_t x )
+{
+    reg.a |= x;
+    reg.fAuxCarry = false;
+    reg.fCarry = false;
+    set_sign_zero_parity( reg.a );
+
+    if ( Z80Mode )
+    {
+        reg.fWasSubtract = false;
+        reg.z80_assignYX( reg.a );
+    }
+} //op_ora
+
+template <bool Z80Mode> force_inlined void op_xra( uint8_t x )
+{
+    reg.a ^= x;
+    reg.fAuxCarry = false;
+    reg.fCarry = false;
+    set_sign_zero_parity( reg.a );
+
+    if ( Z80Mode )
+    {
+        reg.fWasSubtract = false;
+        reg.z80_assignYX( reg.a );
+    }
+} //op_xra
+
+template <bool Z80Mode> void op_math( uint8_t opcode, uint8_t src )
+{
+    uint8_t math = ( opcode >> 3 ) & 7;
+    assert( math <= 7 );
+    if ( 7 == math ) op_cmp<Z80Mode>( src );         // in order of usage for performance
+    else if ( 6 == math ) op_ora<Z80Mode>( src );
+    else if ( 4 == math ) op_ana<Z80Mode>( src );
+    else if ( 5 == math ) op_xra<Z80Mode>( src );
+    else if ( 0 == math ) op_add<Z80Mode>( src );
+    else if ( 2 == math ) reg.a = op_sub<Z80Mode>( src ); // sub doesn't update reg.a
+    else if ( 1 == math ) op_adc<Z80Mode>( src );
+    else op_sbb<Z80Mode>( src ); // 3
+} //op_math
+
+template <bool Z80Mode> force_inlined void op_dad( uint16_t x )
+{
+    // add x to H and set Carry if warranted
+
+    uint16_t oldH = reg.H();
+    uint32_t result = (uint32_t) oldH + (uint32_t) x;
+    reg.fCarry = ( 0 != ( 0x10000 & result ) );
+
+    if ( Z80Mode )
+    {
+        uint32_t auxResult = ( oldH & 0xfff ) + ( x & 0xfff );
+        reg.fAuxCarry = ( 0 != ( auxResult & 0xf000 ) );
+        reg.fWasSubtract = false;
+        reg.z80_assignYX( (uint8_t) ( result >> 8 ) );
+        reg.z80_set_memptr( oldH + 1 );
+    }
+
+    reg.SetH( (uint16_t) ( result & 0xffff ) );
+} //op_dad
+
+template <bool Z80Mode> force_inlined void op_cma()
+{
+    reg.a = ~reg.a;
+    if ( Z80Mode )
+    {
+        reg.fAuxCarry = true;
+        reg.fWasSubtract = true;
+        reg.z80_assignYX( reg.a );
+    }
+} //op_cma
+
+template <bool Z80Mode> force_inlined void op_cmc()
+{
+    reg.fCarry = !reg.fCarry;
+    if ( Z80Mode )
+    {
+        reg.fWasSubtract = false;
+        reg.fAuxCarry = !reg.fCarry; // some docs say !reg.fAuxCarry
+        reg.z80_assignYX( reg.a );
+    }
+} //op_cmc
+
+template <bool Z80Mode> not_inlined void op_daa()
+{
+    if ( Z80Mode ) // this BCD add logic pulled from Sean Young's doc
+    {
+        uint8_t diff = 0x66;
+        uint8_t hn = ( ( reg.a >> 4 ) & 0xf );
+        uint8_t ln = ( reg.a & 0xf );
+
+        if ( reg.fCarry )
+        {
+            if ( !reg.fAuxCarry && ln <= 9 )
+                diff = 0x60;
+        }
+        else
+        {
+            if ( hn <= 9 && !reg.fAuxCarry && ln <= 9 )
+                diff = 0;
+            else if ( ( hn <= 9 && reg.fAuxCarry && ln <= 9 ) || ( hn <= 8 && ln > 9 ) )
+                diff = 6;
+            else if ( hn > 9 && !reg.fAuxCarry && ln <= 9 )
+                diff = 0x60;
+        }
+
+        bool newCarry = reg.fCarry;
+        if ( !reg.fCarry )
+        {
+            if ( ( hn <= 9 && ln <= 9 ) || ( hn <= 8 && ln > 9 ) )
+                newCarry = false;
+            else if ( ( hn >= 9 && ln > 9 ) || ( hn > 9 && ln <= 9 ) )
+                newCarry = true;
+        }
+
+        bool newAuxCarry = reg.fAuxCarry;
+        if ( reg.fWasSubtract )
+        {
+            if ( !reg.fAuxCarry )
+                newAuxCarry = false;
+            else
+                newAuxCarry = ( ln < 6 );
+        }
+        else
+            newAuxCarry = ( ln > 9 );
+
+        if ( reg.fWasSubtract )
+            reg.a -= diff;
+        else
+            reg.a += diff;
+
+        set_sign_zero_parity( reg.a );
+        reg.z80_assignYX( reg.a );
+        reg.fCarry = newCarry;
+        reg.fAuxCarry = newAuxCarry;
+    }
+    else
+    {
+        uint8_t loNibble = reg.a & 0xf;
+        uint8_t toadd = 0;
+        if ( reg.fAuxCarry || ( loNibble > 9 ) )
+            toadd = 6;
+
+        bool carry = reg.fCarry;
+        uint8_t hiNibble = reg.a & 0xf0;
+        if ( ( hiNibble > 0x90 ) || ( hiNibble >= 0x90 && loNibble > 0x9 ) || carry )
+        {
+            toadd |= 0x60;
+            carry = true;
+        }
+
+        op_add<Z80Mode>( toadd );
+        reg.fCarry = carry; // this doesn't change regardless of the result
+    }
+} //op_daa
+
+force_inlined uint8_t * dst_address_rm( uint8_t rm )
+{
+    assert( rm <= 7 );
+    if ( 6 != rm )
+        return reg.regOffset( rm );
+
+    return & memory[ reg.H() ];
+} //dst_address_rm
+
+force_inlined uint8_t * dst_address( uint8_t op )
+{
+    uint8_t rm = 7 & ( op >> 3 );
+    return dst_address_rm( rm );
+} //dst_address
+
+force_inlined uint8_t src_value_rm( uint8_t rm )
+{
+    if ( 6 != rm )
+        return * ( reg.regOffset( rm ) );
+    return memory[ reg.H() ];
+} //src_value_rm
+
+force_inlined uint8_t src_value( uint8_t op )
+{
+    uint8_t rm = 0x7 & op;
+    return src_value_rm( rm );
+} //src_value
+
+not_inlined void z80_ni( uint8_t op, uint8_t op2 )
+{
+    x80_hard_exit( "bugbug: not-implemented z80 instruction: %#x, next byte is %#x\n", op, op2 );
+} //z80_ni
+
+bool check_conditional( uint8_t op ); // defined below; needed by z80_execute_unprefixed
+uint32_t z80_emulate( uint8_t op, uint16_t & pc, uint16_t & sp ); // defined below; needed by z80_execute_unprefixed
+#if Z80_ZILOG_SCF_CCF
+static uint16_t g_z80PreviousStart = 0; // where the instruction before started, for scf and ccf after a dd or fd prefix
+static uint8_t z80_scf_ccf_yx( uint16_t previousStart ); // defined below
+#endif
+
+#ifndef WATCOMDOS // this is above-and-beyond emulation no app or widely-used test suite verifies and it's too big for WATCOMDOS
+
+// On real Z80 hardware, a DD/FD prefix has no effect on the operands or
+// semantics of any instruction that doesn't reference H, L, or (HL): the
+// following opcode executes with its normal instruction semantics. The
+// DD/FD prefix is nevertheless consumed as an additional M1/prefix cycle,
+// including its own effect on the refresh register (see z80_bump_r() at the
+// 0xdd/0xfd case's own call site, below). Every instruction that *does*
+// reference H/L/(HL) is already redirected to IX/IY (or IXH/IXL/(IX+d)) by
+// the explicit cases in the 0xdd/0xfd handler; this function covers the
+// rest of the opcode space so that code compiled or assembled with an
+// incidental DD/FD prefix -- for example a timing-padded DEC D (0xFD 0x15),
+// seen in a real CP/M PIP.COM -- executes correctly instead of aborting the
+// emulator. It reuses the same low-level helpers as the primary
+// dual-mode dispatch (with the Z80Mode template parameter hardcoded true:
+// DD/FD prefixes only ever occur in Z80 mode) to avoid duplicating
+// instruction semantics. Ported from a fix verified against dcc's
+// dcc_debug_host/x80.cxx (github.com/davidly/dcc PR #175).
+//
+// HALT (0x76) is excluded before this function is ever called (see the
+// 0xdd/0xfd handler) and still routes to z80_ni: on real hardware DD 76 /
+// FD 76 is plain, undisturbed HALT, but correctly stopping this emulator's
+// instruction-fetch loop immediately (matching the real, unprefixed 0x76
+// case) would require signaling back across a function-call boundary that
+// doesn't exist today, so it is deliberately left as a disclosed,
+// not-implemented limitation rather than approximated.
+//
+// The debug-hook opcode (0x64, unprefixed MOV H,H in this codebase's own
+// convention) is never seen here either, but for an entirely different
+// reason: its prefixed form (DD 64 / FD 64) is genuinely, if
+// undocumentedly, LD IXH,IXH / LD IYH,IYH on real hardware, and is already
+// correctly handled by the pre-existing ranged MOV-redirect case in the
+// 0xdd/0xfd handler (it matches ANY plain register-to-register MOV form,
+// whether or not that form references H/L, substituting IXH/IYH only for
+// the specific H-slot) -- the debug-hook convention is deliberately
+// unprefixed-opcode-only and has no bearing on the prefixed form.
+uint32_t z80_execute_unprefixed( uint8_t op, uint8_t op2, uint16_t & pc, uint16_t & sp )
+{
+    uint32_t cycles = z80_cycles[ op2 ];
+    switch ( op2 )
+    {
+        case 0x00: break; // nop
+        case 0x01: case 0x11: { * reg.rpAddressFromLowOp( op2 ) = pcword( pc ); break; } // lxi bc/de
+        case 0x31: sp = pcword( pc ); break; // lxi sp, d16
+        case 0x02: { memory[ reg.B() ] = reg.a; reg.z80_set_memptr( ( (uint16_t) reg.a << 8 ) | ( ( reg.B() + 1 ) & 0xff ) ); break; } // stax b
+        case 0x03: case 0x13: { uint16_t * pdst = reg.rpAddressFromLowOp( op2 ); *pdst = 1 + *pdst; break; } // inx bc/de
+        case 0x33: sp = sp + 1; break; // inx sp
+        case 0x04: case 0x14: case 0x0c: case 0x1c: case 0x3c: { uint8_t * pdst = dst_address( op2 ); *pdst = op_inc<true>( *pdst ); break; } // inr b/d/c/e/a
+        case 0x05: case 0x15: case 0x0d: case 0x1d: case 0x3d: { uint8_t * pdst = dst_address( op2 ); *pdst = op_dec<true>( *pdst ); break; } // dcr b/d/c/e/a
+        case 0x06: case 0x16: case 0x0e: case 0x1e: case 0x3e: * dst_address( op2 ) = pcbyte( pc ); break; // mvi b/d/c/e/a, d8
+        case 0x07: reg.fCarry = ( 0 != ( reg.a & 0x80 ) ); reg.a = (uint8_t) ( reg.a << 1 ); if ( reg.fCarry ) reg.a |= 1; reg.clearHN(); reg.z80_assignYX( reg.a ); break; // rlc
+        case 0x0a: reg.z80_set_memptr( reg.B() + 1 ); reg.a = memory[ reg.B() ]; break; // ldax b
+        case 0x0b: case 0x1b: { uint16_t * pdst = reg.rpAddressFromOp( op2 ); *pdst = *pdst - 1; break; } // dcx bc/de
+        case 0x3b: sp = sp - 1; break; // dcx sp
+        case 0x0f: reg.fCarry = ( 0 != ( reg.a & 1 ) ); reg.a = (uint8_t) ( reg.a >> 1 ); if ( reg.fCarry ) reg.a |= 0x80; reg.clearHN(); reg.z80_assignYX( reg.a ); break; // rrc
+        case 0x12: { memory[ reg.D() ] = reg.a; reg.z80_set_memptr( ( (uint16_t) reg.a << 8 ) | ( ( reg.D() + 1 ) & 0xff ) ); break; } // stax d
+        case 0x17: { bool c = reg.fCarry; reg.fCarry = ( 0 != ( 0x80 & reg.a ) ); reg.a = (uint8_t) ( reg.a << 1 ); if ( c ) reg.a |= 1; reg.clearHN(); reg.z80_assignYX( reg.a ); break; } // ral
+        case 0x1a: reg.z80_set_memptr( reg.D() + 1 ); reg.a = memory[ reg.D() ]; break; // ldax d
+        case 0x1f: { bool c = reg.fCarry; reg.fCarry = ( 0 != ( reg.a & 1 ) ); reg.a = (uint8_t) ( reg.a >> 1 ); if ( c ) reg.a |= 0x80; reg.clearHN(); reg.z80_assignYX( reg.a ); break; } // rar
+        case 0x27: op_daa<true>(); break;
+        case 0x2f: op_cma<true>(); break;
+        case 0x32: { uint16_t addr = pcword( pc ); memory[ addr ] = reg.a; reg.z80_set_memptr( ( (uint16_t) reg.a << 8 ) | ( ( addr + 1 ) & 0xff ) ); break; } // sta a16
+#if Z80_ZILOG_SCF_CCF
+        case 0x37: reg.z80_assignYX( z80_scf_ccf_yx( g_z80PreviousStart ) ); reg.fCarry = 1; reg.clearHN(); break; // stc
+        case 0x3f: { uint8_t yx = z80_scf_ccf_yx( g_z80PreviousStart ); op_cmc<true>(); reg.z80_assignYX( yx ); break; }
+#else
+        case 0x37: reg.fCarry = 1; reg.clearHN(); reg.z80_assignYX( reg.a ); break; // stc
+        case 0x3a: { uint16_t addr = pcword( pc ); reg.a = memory[ addr ]; reg.z80_set_memptr( addr + 1 ); break; } // lda a16
+        case 0x3f: op_cmc<true>(); break;
+#endif
+        case 0x80: case 0x81: case 0x82: case 0x83: case 0x87: op_add<true>( src_value( op2 ) ); break;
+        case 0x88: case 0x89: case 0x8a: case 0x8b: case 0x8f: op_adc<true>( src_value( op2 ) ); break; // adc
+        case 0x90: case 0x91: case 0x92: case 0x93: case 0x97: reg.a = op_sub<true>( src_value( op2 ) ); break;
+        case 0x98: case 0x99: case 0x9a: case 0x9b: case 0x9f: op_sbb<true>( src_value( op2 ) ); break;
+        case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa7: op_ana<true>( src_value( op2 ) ); break;
+        case 0xa8: case 0xa9: case 0xaa: case 0xab: case 0xaf: op_xra<true>( src_value( op2 ) ); break;
+        case 0xb0: case 0xb1: case 0xb2: case 0xb3: case 0xb7: op_ora<true>( src_value( op2 ) ); break;
+        case 0xb8: case 0xb9: case 0xba: case 0xbb: case 0xbf: op_cmp<true>( src_value( op2 ) ); break;
+        case 0xc0: case 0xd0: case 0xe0: case 0xf0: case 0xc8: case 0xd8: case 0xe8: case 0xf8: // conditional return
+            if ( check_conditional( op2 ) ) { pc = popword( sp ); reg.z80_set_memptr( pc ); }
+            else cycles -= cyclesnt;
+            break;
+        case 0xc1: case 0xd1: * reg.rpAddressFromOp( op2 ) = popword( sp ); break; // pop bc/de
+        case 0xc2: case 0xd2: case 0xe2: case 0xf2: case 0xca: case 0xda: case 0xea: case 0xfa: // conditional jmp
+        {
+            uint16_t address = pcword( pc );
+            reg.z80_set_memptr( address );
+            if ( check_conditional( op2 ) )
+                pc = address;
+            break;
+        }
+        case 0xc3: { uint16_t address = pcword( pc ); reg.z80_set_memptr( address ); pc = address; break; } // jmp a16
+        case 0xc4: case 0xd4: case 0xe4: case 0xf4: case 0xcc: case 0xdc: case 0xec: case 0xfc: // conditional call
+        {
+            uint16_t address = pcword( pc );
+            reg.z80_set_memptr( address );
+            if ( check_conditional( op2 ) )
+            {
+                pushword( sp, pc );
+                pc = address;
+            }
+            else
+                cycles -= 7; // not-taken CALL cc is 10T on Z80 (17-7)
+            break;
+        }
+        case 0xc5: case 0xd5: pushword( sp, * reg.rpAddressFromOp( op2 ) ); break; // push bc/de
+        case 0xc6: op_add<true>( pcbyte( pc ) ); break; // adi
+        case 0xc7: case 0xd7: case 0xe7: case 0xf7: case 0xcf: case 0xdf: case 0xef: case 0xff: // rst
+            pushword( sp, pc );
+            pc = 0x38 & (uint16_t) op2;
+            reg.z80_set_memptr( pc );
+            break;
+        case 0xc9: pc = popword( sp ); reg.z80_set_memptr( pc ); break; // ret
+        case 0xcd: { uint16_t t = pcword( pc ); reg.z80_set_memptr( t ); pushword( sp, pc ); pc = t; break; } // call a16
+        case 0xce: op_adc<true>( pcbyte( pc ) ); break; // aci
+        case 0xd3: { uint8_t port = pcbyte( pc ); x80_invoke_out( port ); reg.z80_set_memptr( ( (uint16_t) reg.a << 8 ) | ( ( port + 1 ) & 0xff ) ); break; } // out d8
+        case 0xd6: reg.a = op_sub<true>( pcbyte( pc ) ); break; // sui
+        case 0xdb: { uint8_t port = pcbyte( pc ); reg.z80_set_memptr( ( (uint16_t) reg.a << 8 ) + port + 1 ); x80_invoke_in( port ); break; } // in d8
+        case 0xde: op_sbb<true>( pcbyte( pc ) ); break; // sbi
+        case 0xe6: op_ana<true>( pcbyte( pc ) ); break; // ani
+        case 0xeb: { uint16_t t = reg.H(); reg.SetH( reg.D() ); reg.SetD( t ); break; } // xchg -- undocumented on real hardware: DD/FD-prefixed EX DE,HL is unaffected
+        case 0xee: op_xra<true>( pcbyte( pc ) ); break; // xri
+        case 0xf1: reg.SetPSW<true>( popword( sp ) ); break; // pop psw
+        case 0xf3: reg.fINTE = false; break; // di
+        case 0xf5: pushword( sp, reg.PSW<true>() ); break; // push psw
+        case 0xf6: op_ora<true>( pcbyte( pc ) ); break; // ori
+        case 0xfb: reg.fINTE = true; break; // ei
+        case 0xfe: op_cmp<true>( pcbyte( pc ) ); break; // cpi
+        // Z80-only opcodes with no H/L involvement (EX AF,AF', DJNZ, JR
+        // variants, EXX, ED-prefixed instructions) are dispatched exactly as
+        // if unprefixed by reusing the existing, already-tested handler; ED
+        // in particular is documented to always ignore a preceding DD/FD.
+        case 0x08: case 0x10: case 0x18: case 0x20: case 0x28: case 0x30: case 0x38: case 0xd9: case 0xed:
+            cycles = z80_emulate( op2, pc, sp );
+            break;
+        default:
+            z80_ni( op, op2 );
+    }
+    return cycles;
+} //z80_execute_unprefixed
+
+#endif // WATCOMDOS
+
+// real hardware never advances pc during a block-repeat instruction; it just
+// re-fetches the same ed/op2 bytes from memory on every iteration. self-
+// modifying code that overwrites those bytes mid-repeat (z80test's
+// LDIR->NOP'/LDDR->NOP' deliberately do this) makes the *next* fetch see
+// different bytes and the instruction stops repeating. this checks whether
+// that's happened so the repeat loops below can detect it without having to
+// re-fetch on every single iteration in the overwhelmingly common case
+// where nothing self-modifies.
+#if Z80_ZILOG_SCF_CCF
+// Whether the instruction at address wrote the flags as an operation's result. POP AF and EX AF,AF'
+// load F instead, and like every other instruction they count as not writing it.
+static bool z80_wrote_flags( uint16_t address )
+{
+    uint8_t op = memory[ address ];
+    while ( 0xdd == op || 0xfd == op )
+    {
+        address++;
+        op = memory[ address ];
+        if ( 0xcb == op ) // dd/fd cb d op: as cb op
+            return memory[ (uint16_t) ( address + 2 ) ] < 0x80;
+    }
+    if ( 0xcb == op )
+        return memory[ (uint16_t) ( address + 1 ) ] < 0x80; // rotates, shifts and bit; not res or set
+    if ( 0xed == op )
+    {
+        uint8_t op2 = memory[ (uint16_t) ( address + 1 ) ];
+        if ( 0xa0 == ( op2 & 0xe4 ) )
+            return true; // ldi, cpi, ini, outi and their d and repeating forms
+        uint8_t low = op2 & 0x07;
+        return ( op2 >= 0x40 && op2 < 0x80 ) && ( 0 == low || 2 == low || 4 == low ||                // in r,(c), adc/sbc hl, neg
+                                                  0x57 == op2 || 0x5f == op2 || 0x67 == op2 || 0x6f == op2 ); // ld a,i / ld a,r / rrd / rld
+    }
+    if ( op >= 0x80 && op < 0xc0 )
+        return true; // add, adc, sub, sbc, and, xor, or, cp
+    switch ( op )
+    {
+        case 0x04: case 0x0c: case 0x14: case 0x1c: case 0x24: case 0x2c: case 0x34: case 0x3c: // inc
+        case 0x05: case 0x0d: case 0x15: case 0x1d: case 0x25: case 0x2d: case 0x35: case 0x3d: // dec
+        case 0x07: case 0x0f: case 0x17: case 0x1f: case 0x27: case 0x2f: case 0x37: case 0x3f: // rotates, daa, cpl, scf, ccf
+        case 0x09: case 0x19: case 0x29: case 0x39:                                             // add hl,rr
+        case 0xc6: case 0xce: case 0xd6: case 0xde: case 0xe6: case 0xee: case 0xf6: case 0xfe: // alu with immediates
+            return true;
+    }
+    return false;
+} //z80_wrote_flags
+
+// Y and X for SCF and CCF on a Zilog Z80: from A, ORed with F's when the instruction before didn't write
+// F. Call it before the instruction changes the flags.
+static uint8_t z80_scf_ccf_yx( uint16_t previousStart )
+{
+    uint8_t yx = reg.a;
+    if ( !z80_wrote_flags( previousStart ) )
+        yx |= (uint8_t) ( ( (int) reg.fY << 5 ) | ( (int) reg.fX << 3 ) );
+    return yx;
+} //z80_scf_ccf_yx
+#endif
+
+bool z80_block_repeat_self_modified( uint16_t pc, uint8_t op2 )
+{
+    return ( 0xed != memory[ (uint16_t) ( pc - 2 ) ] ) || ( op2 != memory[ (uint16_t) ( pc - 1 ) ] );
+} //z80_block_repeat_self_modified
+
+// The flags INI, IND, OUTI and OUTD leave, as do INIR, INDR, OTIR and OTDR after their last pass,
+// per Sean Young's "The Undocumented Z80 Documented": S, Z, Y and X as DEC B gives them; N is bit 7
+// of the byte moved; and with k the byte plus L after the move (OUTI, OUTD) or C + 1 or C - 1
+// (INI, IND), H and C are set if k > 255 and P/V is the parity of ( k & 7 ) ^ B.
+void z80_block_io_flags( uint8_t value, uint8_t other )
+{
+    unsigned k = (unsigned) value + other;
+    reg.fSign = ( 0 != ( reg.b & 0x80 ) );
+    reg.fZero = ( 0 == reg.b );
+    reg.z80_assignYX( reg.b );
+    reg.fWasSubtract = ( 0 != ( value & 0x80 ) );
+    reg.fAuxCarry = reg.fCarry = ( k > 0xff );
+    set_parity( (uint8_t) ( ( k & 7 ) ^ reg.b ) );
+} //z80_block_io_flags
+
+// A pass of LDIR, LDDR, CPIR or CPDR that will repeat takes Y and X from bits 13 and 11 of the
+// instruction's address instead (found in 2018, after "The Undocumented Z80 Documented"). Here that
+// is only seen when self-modification cuts the repeat short. INIR and friends also change H and P/V
+// on such a pass; that is not modeled.
+void z80_block_repeat_yx( uint16_t address )
+{
+    reg.z80_assignYX( (uint8_t) ( address >> 8 ) );
+} //z80_block_repeat_yx
+
+void z80_op_bit( uint8_t val, uint8_t bit, z80_value_source vs )
+{
+    assert( bit <= 7 );
+    reg.fAuxCarry = true; // per doc
+    reg.fWasSubtract = false;
+
+    reg.fSign = ( ( 7 == bit ) && ( 0 != ( 0x80 & val ) ) ); // Zilog doc says fSign is "unknown", but hardware does this
+    uint8_t cmp = ( 1 << bit );
+    reg.fZero = ( 0 == ( val & cmp ) );
+    reg.fParityEven_Overflow = reg.fZero;  // non-documented
+
+    // Y and X are set from the source value, not as 4.1 from "The Undocumented Z80 Documented"
+    // has from the value resulting from the bit operation. But only if the source is a register.
+
+    if ( vs_register == vs )
+        reg.z80_assignYX( val );
+    else
+        reg.z80_assignYX_from_memptr();
+} //z80_op_bit
+
+void z80_op_rlc( uint8_t * pval )
+{
+    // rotate left carry. 7 bit to both C and 0 bit. flags: S, Z, H reset, Parity, N reset, and C
+
+    uint8_t x = *pval;
+    bool bit7 = ( 0 != ( x & 0x80 ) );
+    x <<= 1;
+    reg.fCarry = bit7;
+    if ( bit7 )
+        x |= 1;
+    set_sign_zero_parity( x );
+    reg.fAuxCarry = false;
+    reg.fWasSubtract = false;
+    reg.z80_assignYX( x );
+    *pval = x;
+} //z80_op_rlc
+
+void z80_op_rl( uint8_t * pval )
+{
+    // rotate left. 7 bit to C. Old carry bit to 0. flags: S, Z, H reset, Parity, N reset, and C
+
+    uint8_t x = *pval;
+    bool bit7 = ( 0 != ( x & 0x80 ) );
+    x <<= 1;
+    if ( reg.fCarry )
+        x |= 1;
+    reg.fCarry = bit7;
+    set_sign_zero_parity( x );
+    reg.fAuxCarry = false;
+    reg.fWasSubtract = false;
+    reg.z80_assignYX( x );
+    *pval = x;
+} //z80_op_rl
+
+void z80_op_rrc( uint8_t * pval )
+{
+    // rotate right carry. 0 bit to both C and 7 bit. flags: S, Z, H reset, Parity, N reset, and C
+
+    uint8_t x = *pval;
+    bool bit0 = ( 0 != ( x & 1 ) );
+    x >>= 1;
+    reg.fCarry = bit0;
+    if ( bit0 )
+        x |= 0x80;
+    set_sign_zero_parity( x );
+    reg.fAuxCarry = false;
+    reg.fWasSubtract = false;
+    reg.z80_assignYX( x );
+    *pval = x;
+} //z80_op_rrc
+
+void z80_op_rr( uint8_t * pval )
+{
+    // rotate right. 0 bit to C. Old C to 7 bit. flags: S, Z, H reset, Parity, N reset, and C
+
+    uint8_t x = *pval;
+    bool bit0 = ( 0 != ( x & 1 ) );
+    x >>= 1;
+    if ( reg.fCarry )
+        x |= 0x80;
+    reg.fCarry = bit0;
+    set_sign_zero_parity( x );
+    reg.fAuxCarry = false;
+    reg.fWasSubtract = false;
+    reg.z80_assignYX( x );
+    *pval = x;
+} //z80_op_rr
+
+uint16_t z80_op_sub_16( uint16_t lhs, uint16_t rhs, bool borrow = false )
+{
+    // com == ones-complement
+
+    uint16_t com_rhs = ~rhs;
+    uint16_t borrow_int = borrow ? 0 : 1;
+    uint32_t res32 =  (uint32_t) lhs + (uint32_t) com_rhs + (uint32_t) borrow_int;
+    uint16_t res16 = res32 & 0xffff;
+
+    reg.fCarry = ( 0 == ( res32 & 0x10000 ) );
+    z80_set_sign_zero_16( res16 );
+
+    // if not ( ( one of lhs and com_rhs are negative ) and ( one of lhs and result are negative ) )
+
+    reg.fParityEven_Overflow = ! ( ( lhs ^ com_rhs ) & 0x8000 ) && ( ( lhs ^ res16 ) & 0x8000 );
+    reg.fWasSubtract = true;
+    reg.fAuxCarry = ( ( ( rhs & 0xfff ) + ( borrow ? 1 : 0 ) ) > ( lhs & 0xfff ) ); // borrow from bit 12; add the carry after masking
+    reg.z80_assignYX( res16 >> 8 );
+
+    return res16;
+} //z80_op_sub_16
+
+uint16_t z80_op_add_16( uint16_t a, uint16_t b )
+{
+    uint32_t resultAux = ( (uint32_t) ( a & 0xfff ) + (uint32_t) ( b & 0xfff ) );
+    reg.fAuxCarry = ( 0 != ( resultAux & 0xfffff000 ) );
+    reg.fWasSubtract = false;
+
+    uint32_t result = ( (uint32_t) a + (uint32_t) b );
+    reg.fCarry = ( 0 != ( result & 0x10000 ) );
+    reg.z80_assignYX( (uint8_t) ( result >> 8 ) );
+
+    return (uint16_t) result;
+} //z80_op_add_16
+
+uint16_t z80_op_adc_16( uint16_t l, uint16_t r )
+{
+    uint16_t carryOut, result, resultAux;
+
+    if ( reg.fCarry )
+    {
+        carryOut = ( l >= ( 0xffff - r ) );
+        result = r + l + 1;
+        resultAux = ( 0xfff & r ) + ( 0xfff & l ) + 1;
+    }
+    else
+    {
+        carryOut = ( l > ( 0xffff - r ) );
+        result = r + l;
+        resultAux = ( 0xfff & r ) + ( 0xfff & l );
+    }
+
+    reg.z80_assignYX( result >> 8 );
+    reg.fAuxCarry = ( 0 != ( 0xf000 & resultAux ) );
+    uint16_t carryIns = result ^ l ^ r;
+    z80_set_sign_zero_16( result );
+    reg.fParityEven_Overflow = ( carryIns >> 15 ) ^ carryOut;
+    reg.fCarry = ( 0 != carryOut );
+    reg.fWasSubtract = false;
+    return result;
+} //z80_op_adc_16
+
+void z80_op_sla( uint8_t * pval )
+{
+    uint8_t val = *pval;
+    reg.fCarry = ( 0 != ( val & 0x80 ) );
+    val <<= 1;
+    set_sign_zero_parity( val );
+    reg.clearHN();
+    reg.z80_assignYX( val );
+    *pval = val;
+} //z80_op_sla
+
+void z80_op_sll( uint8_t * pval ) // not a documented opcode
+{
+    uint8_t val = *pval;
+    reg.fCarry = ( 0 != ( val & 0x80 ) );
+    val <<= 1;
+    val |= 1;
+    set_sign_zero_parity( val );
+    reg.clearHN();
+    reg.z80_assignYX( val );
+    *pval = val;
+} //z80_op_sll
+
+void z80_op_sra( uint8_t * pval )
+{
+    uint8_t val = *pval;
+    reg.fCarry = ( 0 != ( val & 1 ) );
+    val >>= 1;
+    val |= ( ( *pval ) & 0x80 ); // leave high bit unchanged
+    set_sign_zero_parity( val );
+    reg.clearHN();
+    reg.z80_assignYX( val );
+    *pval = val;
+} //z80_op_sra
+
+void z80_op_srl( uint8_t * pval )
+{
+    uint8_t val = *pval;
+    reg.fCarry = ( val & 1 );
+    val >>= 1;
+    set_sign_zero_parity( val );
+    reg.clearHN();
+    reg.z80_assignYX( val );
+    *pval = val;
+} //z80_op_srl
+
+always_inlined uint32_t z80_emulate( uint8_t op, uint16_t & pc, uint16_t & sp )    // this is just for instructions that aren't shared with 8080
+{
+    // uint32_t, not uint16_t: BC can be up to 0xFFFF (0 counts as 0x10000 -
+    // decrement-then-test wraps 0 to 0xFFFF before the loop condition sees
+    // it, running the full 65536 iterations, matching real Z80 hardware) and
+    // ldir/lddr/cpir/cpdr cost ~21T per iteration, so a single one of these
+    // can cost up to ~1.38M cycles - already past uint16_t range on its own.
+    uint32_t cycles = 4; // general-purpose default
+
+    switch ( op )
+    {
+        case 0x08: // ex af and af'
+        {
+            swap( reg.a, reg.ap );
+            reg.materializeFlags<true>(); // z80_emulate is only ever reached in Z80 mode
+            swap( reg.f, reg.fp );
+            reg.unmaterializeFlags<true>();
+            break;
+        }
+        case 0x10: // djnz
+        {
+            uint8_t offset = pcbyte( pc );
+            reg.b = reg.b - 1;
+            if ( 0 != reg.b )
+            {
+                pc = pc + (int16_t) (int8_t) offset;
+                cycles = 13;
+                reg.z80_set_memptr( pc );
+            }
+            else
+                cycles = 8;
+            break;
+        }
+        case 0x18: // jr n
+        {
+            uint8_t offset = pcbyte( pc );
+            pc = pc + (int16_t) (int8_t) offset;
+            cycles = 12;
+            reg.z80_set_memptr( pc );
+            break;
+        }
+        case 0x20: // jr nz, n
+        {
+            uint8_t offset = pcbyte( pc );
+            if ( !reg.fZero )
+            {
+                pc = pc + (int16_t) (int8_t) offset;
+                cycles = 12;
+                reg.z80_set_memptr( pc );
+            }
+            else
+                cycles = 7;
+            break;
+        }
+        case 0x28: // jr z, n
+        {
+            uint8_t offset = pcbyte( pc );
+            if ( reg.fZero )
+            {
+                pc = pc + (int16_t) (int8_t) offset;
+                cycles = 12;
+                reg.z80_set_memptr( pc );
+            }
+            else
+                cycles = 7;
+            break;
+        }
+        case 0x30: // jr nc, n
+        {
+            uint8_t offset = pcbyte( pc );
+            if ( !reg.fCarry )
+            {
+                pc = pc + (int16_t) (int8_t) offset;
+                cycles = 12;
+                reg.z80_set_memptr( pc );
+            }
+            else
+                cycles = 7;
+            break;
+        }
+        case 0x38: // jr c, n
+        {
+            uint8_t offset = pcbyte( pc );
+            if ( reg.fCarry )
+            {
+                pc = pc + (int16_t) (int8_t) offset;
+                cycles = 12;
+                reg.z80_set_memptr( pc );
+            }
+            else
+                cycles = 7;
+            break;
+        }
+        case 0xcb: // rotate / bits
+        {
+            reg.z80_bump_r(); // the opcode after the cb prefix is a second M1 fetch
+            uint8_t op2 = pcbyte( pc ); // get past op2
+
+            if ( op2 <= 0x1f ) // rlc, rrc, rl, rr on rm
+            {
+                uint8_t mod = op2;
+                uint8_t rot = ( mod >> 3 ) & 0x3;
+                uint8_t rm = mod & 0x7;
+                cycles = ( 6 == rm ) ? 15 : 8;
+                uint8_t * pval = dst_address_rm( rm );
+                if ( 0 == rot )
+                    z80_op_rlc( pval );
+                else if ( 1 == rot )
+                    z80_op_rrc( pval );
+                else if ( 2 == rot )
+                    z80_op_rl( pval );
+                else // if ( 3 == rot )
+                    z80_op_rr( pval );
+            }
+            else if ( op2 <= 0x2f ) // sla and sra
+            {
+                uint8_t rm = op2 & 0x7;
+                cycles = ( 6 == rm ) ? 15 : 8;
+                uint8_t * pdst = dst_address_rm( rm );
+                if ( op2 <= 0x27 )
+                    z80_op_sla( pdst );
+                else
+                z80_op_sra( pdst );
+            }
+            else if ( op2 <= 0x3f ) // sll and srl
+            {
+                uint8_t rm = op2 & 0x7;
+                cycles = ( 6 == rm ) ? 15 : 8;
+                uint8_t * pdst = dst_address_rm( rm );
+                if ( op2 <= 0x37 )
+                    z80_op_sll( pdst );
+                else
+                    z80_op_srl( pdst );
+            }
+            else if ( op2 <= 0x7f ) // bit #, rm
+            {
+                uint8_t rm = op2 & 0x7;
+                cycles = ( 6 == rm ) ? 12 : 8;
+                uint8_t bit = ( op2 >> 3 ) & 0x7;
+                uint8_t val = src_value_rm( rm );
+                z80_op_bit( val, bit, ( 6 == rm ) ? vs_memory : vs_register );
+            }
+            else if ( op2 <= 0xbf ) // res bit #, rm  AKA reset
+            {
+                uint8_t rm = op2 & 0x7;
+                cycles = ( 6 == rm ) ? 15 : 8;
+                uint8_t bit = ( op2 >> 3 ) & 0x7;
+                uint8_t val = src_value_rm( rm );
+                uint8_t mask = ~ ( 1 << bit );
+                val &= mask;
+                * dst_address_rm( rm ) = val;
+            }
+            else if ( op2 <= 0xff ) // set bit #, rm
+            {
+                cycles = 8;
+                uint8_t rm = op2 & 0x7;
+                if ( 6 == rm )
+                    cycles += 7;
+                uint8_t bit = ( op2 >> 3 ) & 0x7;
+                uint8_t val = src_value_rm( rm );
+                uint8_t mask = 1 << bit;
+                val |= mask;
+                * dst_address_rm( rm ) = val;
+            }
+            else
+                z80_ni( op, op2 );
+            break;
+        }
+        case 0xd9: // exx   B, D, H with B', D', H'
+        {
+            swap( reg.b, reg.bp );
+            swap( reg.c, reg.cp );
+            swap( reg.d, reg.dp );
+            swap( reg.e, reg.ep );
+            swap( reg.h, reg.hp );
+            swap( reg.l, reg.lp );
+            break;
+        }
+        case 0xdd: case 0xfd: // ix & iy operations
+        {
+            reg.z80_bump_r();
+            uint8_t op2 = pcbyte( pc );
+            uint32_t repeated_prefix_cycles = 0;
+
+            // DD and FD prefixes may be repeated or mixed.  Real Z80s keep
+            // consuming them until a non-DD/FD opcode arrives, with the last
+            // prefix selecting IX or IY.  Every additional prefix is another
+            // 4T M1 cycle and increments R just like the first prefix fetch.
+            // Memory holding nothing but prefixes has no instruction to reach.
+            for ( uint32_t extra = 0; ( 0xdd == op2 || 0xfd == op2 ) && extra < 0x10000; extra++ )
+            {
+                op = op2;
+                repeated_prefix_cycles += 4;
+                reg.z80_bump_r();
+                op2 = pcbyte( pc );
+            }
+
+            // Prefixed HALT (DD 76 / FD 76) executes as plain HALT with the
+            // DD/FD prefix ignored: opcode 0x76 occupies the otherwise
+            // unused "LD (HL),(HL)" slot in the LD r,(HL)/LD (HL),r opcode
+            // grid, repurposed by the hardware as HALT instead, so it was
+            // never an (HL) reference to begin with. This emulator cannot
+            // easily replicate that here: the real, unprefixed 0x76 case
+            // (above, in the main fetch/decode loop) stops that loop
+            // immediately via `goto _all_done`, a label with scope local to
+            // that loop; z80_emulate (this function) is invoked as an
+            // ordinary subroutine call from that loop's default case and has
+            // no way to signal "stop the batch now" back to its caller.
+            // Rather than approximate real hardware with an inaccurate
+            // implementation, prefixed HALT is deliberately left as
+            // not-implemented here.
+            //
+            // This check must run first, before the "ld r, (i+#)" mask just
+            // below: 0x76 (0111 0110) incidentally satisfies that mask
+            // (0x46 == (op2 & 0xc7)) purely by bit-pattern coincidence, and
+            // would otherwise be silently misinterpreted as a load from
+            // (IX+d) into (HL) instead of ever reaching this check.
+            if ( 0x76 == op2 || 0xdd == op2 || 0xfd == op2 )
+            {
+                z80_ni( op, op2 );
+                break;
+            }
+
+            // "ld r, (i+#)" and "ld (i+#), r/#" are checked first because they are by far the most common
+            // ix/iy sub-opcodes in practice -- compilers use ix/iy as a stack frame pointer for local variable
+            // access, so these two patterns dominate real-world instruction mixes. The two checks are mutually
+            // exclusive with every other case below (0x46's bits0-2==6 & bit6 set; 0x70's top 5 bits==0x70;
+            // neither pattern is matched by any of the other exact/ranged op2 checks in this chain).
+
+            if ( 0x46 == ( op2 & 0xc7 ) ) // ld r, (i + #). must include bit 7 in the mask or this
+                                          // wrongly also matches the ALU-immediate opcodes
+                                          // 0xc6/ce/d6/de/e6/ee/f6/fe (adi/aci/sui/sbi/ani/xri/ori/cpi)
+            {
+                cycles = 19;
+                uint8_t op3 = pcbyte( pc ); // consume op3
+                uint16_t address = reg.z80_getIndex( op ) + (uint16_t) (int16_t) (int8_t) op3;
+                reg.z80_set_memptr( address );
+                * dst_address( op2 ) = memory[ address ];
+            }
+            else if ( 0x70 == ( op2 & 0xf8 ) )  // ld (i+#), r/#
+            {
+                cycles = 19;
+                uint8_t op3 = pcbyte( pc ); // consume op3
+
+                // if 6, there is an op4 for the index (not hl-indexed memory); otherwise use a register value
+
+                uint8_t src = op2 & 0x7;
+                uint8_t val = ( 6 == src ) ? pcbyte( pc ) : src_value_rm( src );
+                uint16_t i = reg.z80_getIndex( op );
+                i += (uint16_t) (int16_t) (int8_t) op3;
+                reg.z80_set_memptr( i );
+                memory[ i ] = val;
+            }
+            else if ( 0x21 == op2 )  // ld ix/iy word
+            {
+                cycles = 14;
+                if ( 0xdd == op )
+                    reg.ix = pcword( pc );
+                else
+                    reg.iy = pcword( pc );
+            }
+            else if ( 0x22 == op2 ) // ld (address), ix/iy
+            {
+                cycles = 20;
+                uint16_t address = pcword( pc );
+                setmword( address, reg.z80_getIndex( op ) );
+                reg.z80_set_memptr( address + 1 );
+            }
+            else if ( 0x23 == op2 ) // inc ix/iy     no flags are affected
+            {
+                cycles = 10;
+                if ( 0xdd == op )
+                    reg.ix++;
+                else
+                    reg.iy++;
+            }
+            else if ( 0xe5 == op2 )  // push ix/iy
+            {
+                cycles = 15;
+                uint16_t val = reg.z80_getIndex( op );
+                pushword( sp, val );
+            }
+            else if ( 0xe1 == op2 ) // pop ix/iy
+            {
+                cycles = 14;
+                uint16_t val = popword( sp );
+                reg.z80_setIndex( op, val );
+            }
+            else if ( 0x09 == ( op2 & 0xcf ) ) // add ix/iy, rp
+            {
+                cycles = 15;
+                // only sets H (carry from bit 11) and C (carry from bit 15) flags. ignores C flag on input. N is reset
+                // for add ix, rp is 0..3 bc, de, ix, sp.
+                // for add iy, rp is 0..3 bc, de, iy, sp.
+
+                uint8_t rp = ( 0x3 & ( op2 >> 4 ) );
+                uint16_t rpval = ( 3 == rp ) ? sp : * reg.rpAddressFromOp( op2 );
+                if ( 2 == rp )
+                    rpval = ( 0xdd == op ) ? reg.ix : reg.iy;
+
+                uint16_t oldval = reg.z80_getIndex( op );
+                uint16_t newval = z80_op_add_16( oldval, rpval );
+                reg.z80_setIndex( op, newval );
+                reg.z80_set_memptr( oldval + 1 );
+            }
+            else if ( 0x26 == op2 ) // ld ix/iy h. not documented
+            {
+                cycles = 11;
+                * reg.z80_getIndexByteAddress( op, 0 ) = pcbyte( pc );
+            }
+            else if ( 0x2a == op2 )  // ld ix, (address)
+            {
+                cycles = 20;
+                uint16_t address = pcword( pc );
+                reg.z80_setIndex( op, mword( address ) );
+                reg.z80_set_memptr( address + 1 );
+            }
+            else if ( 0x2b == op2 ) // dec ix/iy   no flags are affected
+            {
+                cycles = 10;
+                if ( 0xdd == op )
+                    reg.ix--;
+                else
+                    reg.iy--;
+            }
+            else if ( 0x2e == op2 ) // ld ix/iy l. not documented
+            {
+                cycles = 11;
+                * reg.z80_getIndexByteAddress( op, 1 ) = pcbyte( pc );
+            }
+            else if ( 0x34 == op2 ) // inc (i + index)
+            {
+                cycles = 23;
+                uint16_t i = reg.z80_getIndex( op ) + (int16_t) (int8_t) pcbyte( pc );
+                reg.z80_set_memptr( i );
+                uint8_t x = memory[ i ];
+                memory[i] = op_inc<true>( x );
+            }
+            else if ( 0x35 == op2 ) // dec (i + index)
+            {
+                cycles = 23;
+                uint16_t i = reg.z80_getIndex( op ) + (int16_t) (int8_t) pcbyte( pc );
+                reg.z80_set_memptr( i );
+                uint8_t x = memory[ i ];
+                memory[ i ] = op_dec<true>( x );
+            }
+            else if ( 0x36 == op2 )  // ld (ix/iy + index), immediate byte
+            {
+                cycles = 19;
+                uint16_t i = reg.z80_getIndex( op ) + (int16_t) (int8_t) pcbyte( pc );
+                reg.z80_set_memptr( i );
+                uint8_t val = pcbyte( pc );
+                memory[ i ] = val;
+            }
+            else if ( ( ( op2 >= 0x40 && op2 <= 0x6f ) || ( op2 >= 0x78 && op2 <= 0x7f ) ) && // ld [bcdeIhIla][bcdeIhIla]
+                      ( ( ( op2 & 0xf ) != 6 ) && ( ( op2 & 0xf ) != 0xe ) ) )
+            {
+                cycles = 8;
+                uint8_t fromval = op2 & 0xf;
+                if ( fromval >= 8 )
+                    fromval -= 8;
+
+                uint8_t tmp = ( 0 == fromval ) ? reg.b :
+                              ( 1 == fromval ) ? reg.c :
+                              ( 2 == fromval ) ? reg.d :
+                              ( 3 == fromval ) ? reg.e :
+                              ( 4 == fromval ) ? reg.z80_getIndexByte( op, 0 ) :
+                              ( 5 == fromval ) ? reg.z80_getIndexByte( op, 1 ) :
+                              reg.a;
+
+                if ( op2 <= 0x47 )
+                    reg.b = tmp;
+                else if ( op2 <= 0x4f )
+                    reg.c = tmp;
+                else if ( op2 <= 0x57 )
+                    reg.d = tmp;
+                else if ( op2 <= 0x5f )
+                    reg.e = tmp;
+                else if ( op2 <= 0x67 )
+                    *reg.z80_getIndexByteAddress( op, 0 ) = tmp;
+                else if ( op2 <= 0x6f )
+                    *reg.z80_getIndexByteAddress( op, 1 ) = tmp;
+                else
+                    reg.a = tmp;
+            }
+            else if ( 0x84 == ( op2 & 0xc6 ) ) // math on ixh/ixl/iyh/iyl with a. 84/85/8c/8d/94/95/9c/9d/a4/a5/ac/ad/b4/b5/bc/bd.
+                                                // the mask must include bit 2 (0xc2 wrongly also matched reg B/C forms
+                                                // like 0x80/0x81/0x88/0x89/etc, which don't reference h/l at all)
+            {
+                cycles = 8;
+                uint8_t value = reg.z80_getIndexByte( op, op2 & 1 );
+                op_math<true>( op2, value );
+            }
+            else if ( 0x86 == ( op2 & 0xc7 ) ) // math on [ ix/iy + index ]
+            {
+                cycles = 19;
+                uint16_t x = reg.z80_getIndex( op );
+                x += (int16_t) (int8_t) pcbyte( pc );
+                reg.z80_set_memptr( x );
+                op_math<true>( op2, memory[ x ] );
+            }
+            else if ( 0x24 == ( op2 & 0xf6 ) ) // inc/dec ixh, ixl, iyh, iyl
+            {
+                cycles = 8;
+                uint8_t *pval = reg.z80_getIndexByteAddress( op, ( op2 >> 3 ) & 1 );
+                if ( op2 & 1 )
+                    *pval = op_dec<true>( *pval );
+                else
+                    *pval = op_inc<true>( *pval );
+            }
+            else if ( 0xcb == op2 ) // bit operations; the displacement and final opcode are not M1 fetches
+            {
+                uint8_t op4 = memory[ pc + 1 ];
+                if ( 0x26 == op4 || 0x2e == op4 || 0x3e == op4 ) // sla, sra, srl [ix/iy + offset]
+                {
+                    cycles = 23;
+                    uint8_t offset = pcbyte( pc ); // the op3
+                    pcbyte( pc ); // the op4
+                    uint16_t index = reg.z80_getIndex( op );
+                    index += (int16_t) (int8_t) offset;
+                    reg.z80_set_memptr( index );
+                    if ( 0x26 == op4 ) // sla
+                        z80_op_sla( & memory[ index ] );
+                    else if ( 0x2e == op4 ) // sra
+                        z80_op_sra( & memory[ index ] );
+                    else // ( 0x3e == op4 ) srl
+                        z80_op_srl( & memory[ index ] );
+                }
+                else if ( op4 <= 0x3f ) // bit shift on memory
+                {
+                    cycles = 23;
+                    uint8_t offset = pcbyte( pc );
+                    pcbyte( pc );
+                    uint16_t index = reg.z80_getIndex( op );
+                    index += (int16_t) (int8_t) offset;
+                    reg.z80_set_memptr( index );
+
+                    if ( op4 <= 0x07 )
+                        z80_op_rlc( & memory[ index ] );
+                    else if ( op4 <= 0x0f )
+                        z80_op_rrc( & memory[ index ] );
+                    else if ( op4 <= 0x17 )
+                        z80_op_rl( & memory[ index ] );
+                    else if ( op4 <= 0x1f )
+                        z80_op_rr( & memory[ index ] );
+                    else if ( op4 <= 0x27 )
+                        z80_op_sla( & memory[ index ] );
+                    else if ( op4 <= 0x2f )
+                        z80_op_sra( & memory[ index ] );
+                    else if ( op4 <= 0x37 )
+                        z80_op_sll( & memory[ index ] );
+                    else if ( op4 <= 0x3f )
+                        z80_op_srl( & memory[ index ] );
+
+                    uint8_t rm = op4 & 0x7;
+                    if ( 6 != rm )          // no write to memory variant
+                        * dst_address_rm( rm ) = memory[ index ];
+                }
+                else if ( op4 >= 0x40 ) // bit/res/set b, (ix/iy + d), including undocumented register destinations
+                {
+                    uint8_t index = pcbyte( pc );
+                    uint8_t mod = pcbyte( pc );
+                    uint8_t rm = mod & 0x7;
+                    uint8_t bit = ( mod >> 3 ) & 0x7;
+                    uint8_t mask = 1 << bit;
+                    uint8_t top2bits = mod & 0xc0;
+                    uint16_t offset = reg.z80_getIndex( op ) + (int16_t) (int8_t) index;
+                    reg.z80_set_memptr( offset );
+                    uint8_t val = memory[ offset ];
+
+                    if ( 0x40 == top2bits ) // bit
+                    {
+                        cycles = 20;
+                        z80_op_bit( val, bit, vs_indexed );
+                    }
+                    else if ( 0x80 == top2bits ) // reset
+                    {
+                        cycles = 23;
+                        val &= (uint8_t) ~mask;
+                        memory[ offset ] = val;
+                        if ( 6 != rm )
+                            * dst_address_rm( rm ) = val;
+                    }
+                    else if ( 0xc0 == top2bits ) // set
+                    {
+                        cycles = 23;
+                        val |= mask;
+                        memory[ offset ] = val;
+                        if ( 6 != rm )
+                            * dst_address_rm( rm ) = val;
+                    }
+                    else
+                        z80_ni( op, op2 );
+                }
+            }
+            else if ( 0xe3 == op2 ) // ex (sp), ix/iy
+            {
+                cycles = 23;
+                uint16_t val = reg.z80_getIndex( op );
+                reg.z80_setIndex( op, mword( sp ) );
+                setmword( sp, val );
+                reg.z80_set_memptr( reg.z80_getIndex( op ) );
+            }
+            else if ( 0xe9 == op2 ) // jp (ix/iy) // the Z80 name makes it look indirect. It's not.
+            {
+                cycles = 8;
+                pc = reg.z80_getIndex( op );
+            }
+            else if ( 0xf9 == op2 ) // ld sp, ix/iy
+            {
+                cycles = 10;
+                sp = reg.z80_getIndex( op );
+            }
+            else
+#ifdef WATCOMDOS
+                z80_ni( op, op2 );
+#else
+                // The unprefixed handler returns the following instruction's
+                // own cycle count, so retain the final ignored DD/FD prefix.
+                cycles = 4 + z80_execute_unprefixed( op, op2, pc, sp );
+#endif
+            cycles += repeated_prefix_cycles;
+            break;
+        }
+        case 0xed: // 16-bit load/store and i/o operations
+        {
+            reg.z80_bump_r();
+            uint8_t op2 = pcbyte( pc );  // consume op2
+
+            if ( 0x43 == ( op2 & 0xcf ) ) // ld (mw), rp AKA ld (nn), dd
+            {
+                cycles = 20;
+                uint8_t rp = ( 0x3 & ( op2 >> 4 ) );
+                uint16_t val = ( 3 == rp ) ? sp : * reg.rpAddressFromOp( op2 );
+                uint16_t addr = pcword( pc );
+                setmword( addr, val );
+                reg.z80_set_memptr( addr + 1 );
+            }
+            else if ( 0x4b == ( op2 & 0xcf ) )      // ld rp, (nn) AKA ld dd, (nn)
+            {
+                cycles = 20;
+                uint8_t rp = ( 0x3 & ( op2 >> 4 ) );
+                uint16_t addr = pcword( pc );
+                uint16_t val = mword( addr );
+                reg.z80_set_memptr( addr + 1 );
+                if ( 3 == rp )
+                    sp = val;
+                else
+                    * reg.rpAddressFromOp( op2 ) = val;
+            }
+            else if ( 0x44 == ( op2 & 0xc7 ) ) // neg; 0x4c/54/5c/64/6c/74/7c are undocumented duplicates
+            {
+                cycles = 8;
+                uint8_t prior = reg.a;
+                reg.a = 0 - reg.a;
+                set_sign_zero( reg.a );
+                reg.fParityEven_Overflow = ( 0x80 == prior );
+                reg.fWasSubtract = true;
+                reg.fCarry = ( 0 != prior );
+                reg.fAuxCarry = ( 0 != ( prior & 0xf ) );
+                reg.z80_assignYX( reg.a );
+            }
+            else if ( 0x47 == op2 ) // ld i,a
+            {
+                cycles = 9;
+                reg.i = reg.a;
+            }
+            else if ( 0x4f == op2 ) // ld r,a
+            {
+                cycles = 9;
+                reg.r = reg.a;
+            }
+            else if ( 0x57 == op2 ) // ld a,i
+            {
+                cycles = 9;
+                reg.a = reg.i;
+                set_sign_zero( reg.a );
+                reg.fParityEven_Overflow = false; // no iff2
+                reg.fWasSubtract = false;
+                reg.fAuxCarry = false;
+                reg.z80_assignYX( reg.a );
+            }
+            else if ( 0x5f == op2 ) // ld a,r
+            {
+                cycles = 9;
+                reg.a = reg.r; // bit 7 is sticky from the last ld r,a; only bits 0-6 auto-increment
+                set_sign_zero( reg.a );
+                reg.fParityEven_Overflow = false; // no iff2
+                reg.fWasSubtract = false;
+                reg.fAuxCarry = false;
+                reg.z80_assignYX( reg.a );
+            }
+            else if ( 0x67 == op2 ) // rrd
+            {
+                cycles = 18;
+                uint8_t mem = memory[ reg.H() ];
+                uint8_t a = reg.a;
+
+                reg.a = ( a & 0xf0 ) | ( mem & 0x0f );
+                uint8_t newmem = ( ( a << 4 ) & 0xf0 ) | ( ( mem >> 4 ) & 0x0f );
+                memory[ reg.H() ] = newmem;
+
+                set_sign_zero_parity( reg.a );
+                reg.clearHN();
+                reg.z80_assignYX( reg.a );
+                reg.z80_set_memptr( reg.H() + 1 );
+            }
+            else if ( 0x6f == op2 ) // rld
+            {
+                cycles = 18;
+                uint8_t mem = memory[ reg.H() ];
+                uint8_t a = reg.a;
+
+                uint8_t newmem = ( ( mem << 4 ) & 0xf0 ) | ( a & 0x0f );
+                reg.a = ( ( mem >> 4 ) & 0xf ) | ( a & 0xf0 );
+                memory[ reg.H() ] = newmem;
+
+                set_sign_zero_parity( reg.a );
+                reg.clearHN();
+                reg.z80_assignYX( reg.a );
+                reg.z80_set_memptr( reg.H() + 1 );
+            }
+            else if ( 0x4a == ( op2 & 0xcf ) ) // adc hl, rp
+            {
+                cycles = 15;
+                uint8_t rp = ( 0x3 & ( op2 >> 4 ) );
+                uint16_t rpval = ( 3 == rp ) ? sp : * reg.rpAddressFromOp( op2 );
+                uint16_t oldH = reg.H();
+                uint16_t result = z80_op_adc_16( oldH, rpval );
+                reg.SetH( result );
+                reg.z80_set_memptr( oldH + 1 );
+            }
+            else if ( 0xa0 == op2 ) // ldi
+            {
+                cycles = 16;
+                memory[ reg.D() ] = memory[ reg.H() ];
+                reg.fY = ( 0 != ( ( memory[ reg.H() ] + reg.a ) & 0x02 ) );
+                reg.fX = ( 0 != ( ( memory[ reg.H() ] + reg.a ) & 0x08 ) );
+                reg.SetH( reg.H() + 1 );
+                reg.SetD( reg.D() + 1 );
+                reg.SetB( reg.B() - 1 );
+                reg.fParityEven_Overflow = ( 0 != reg.B() );
+                reg.fAuxCarry = 0;
+                reg.fWasSubtract = 0;
+            }
+            else if ( 0xa1 == op2 ) // cpi
+            {
+                bool oldCarry = reg.fCarry;
+                cycles = 16;
+                uint8_t memval = memory[ reg.H() ];
+                op_cmp<true>( memval );
+                reg.SetH( reg.H() + 1 );
+                reg.SetB( reg.B() - 1 );
+                reg.fParityEven_Overflow = ( 0 != reg.B() );
+                uint8_t n = reg.a - memval - ( reg.fAuxCarry ? 1 : 0 ); // n = A - (HL) - HF
+                reg.fY = ( 0 != ( n & 0x02 ) );
+                reg.fX = ( 0 != ( n & 0x08 ) );
+                reg.fCarry = oldCarry; // carry is not affected
+                reg.z80_set_memptr( reg.memptr + 1 );
+            }
+            else if ( 0xa8 == op2 ) // ldd
+            {
+                cycles = 16;
+                memory[ reg.D() ] = memory[ reg.H() ];
+                reg.fY = ( 0 != ( ( memory[ reg.H() ] + reg.a ) & 0x02 ) );
+                reg.fX = ( 0 != ( ( memory[ reg.H() ] + reg.a ) & 0x08 ) );
+                reg.SetH( reg.H() - 1 );
+                reg.SetD( reg.D() - 1 );
+                reg.SetB( reg.B() - 1 );
+                reg.fParityEven_Overflow = ( 0 != reg.B() );
+                reg.clearHN();
+            }
+            else if ( 0xa9 == op2 ) // cpd
+            {
+                bool oldCarry = reg.fCarry;
+                cycles = 16;
+                uint8_t memval = memory[ reg.H() ];
+                op_cmp<true>( memval );
+                reg.SetH( reg.H() - 1 );
+                reg.SetB( reg.B() - 1 );
+                reg.fParityEven_Overflow = ( 0 != reg.B() );
+                uint8_t n = reg.a - memval - ( reg.fAuxCarry ? 1 : 0 ); // n = A - (HL) - HF
+                reg.fY = ( 0 != ( n & 0x02 ) );
+                reg.fX = ( 0 != ( n & 0x08 ) );
+                reg.fCarry = oldCarry; // carry is not affected
+                reg.z80_set_memptr( reg.memptr - 1 );
+            }
+            else if ( 0xb0 == op2 ) // ldir
+            {
+                cycles = 0;
+                bool modified = false;
+                do
+                {
+                    cycles += 21;
+                    memory[ reg.D() ] = memory[ reg.H() ];
+                    reg.fY = ( 0 != ( ( memory[ reg.H() ] + reg.a ) & 0x02 ) );
+                    reg.fX = ( 0 != ( ( memory[ reg.H() ] + reg.a ) & 0x08 ) );
+                    if ( 1 != reg.B() ) // when bc==1 (the terminating iteration), memptr is unchanged
+                        reg.z80_set_memptr( pc - 1 ); // pc still points past the ed/op2 bytes; pc-1 is instruction_address+1
+                    reg.SetH( reg.H() + 1 );
+                    reg.SetD( reg.D() + 1 );
+                    reg.SetB( reg.B() - 1 );
+                    reg.z80_bump_r(); reg.z80_bump_r(); // each repeat re-examines ed/op2; real hardware bumps r by 2 per iteration
+                    if ( 0 != reg.B() )
+                        modified = z80_block_repeat_self_modified( pc, op2 );
+                } while ( ( 0 != reg.B() ) && !modified );
+
+                if ( modified )
+                {
+                    pc -= 2; // it overwrote its own ed/op2 bytes; let the next fetch re-decode them
+                    z80_block_repeat_yx( pc ); // that pass was going to repeat
+                }
+
+                cycles -= 5; // the last iteration is 16T; repeated iterations are 21T
+                reg.fParityEven_Overflow = ( 0 != reg.B() ); // false on normal completion; true if the repeat was interrupted by self-modification
+                reg.fAuxCarry = 0;
+                reg.fWasSubtract = 0;
+            }
+            else if ( 0xb1 == op2 ) // cpir
+            {
+                bool oldCarry = reg.fCarry;
+                cycles = 0;
+                bool modified = false;
+                do
+                {
+                    cycles += 21;
+                    uint8_t memval = memory[ reg.H() ];
+                    op_cmp<true>( memval );
+                    uint8_t n = reg.a - memval - ( reg.fAuxCarry ? 1 : 0 ); // n = A - (HL) - HF
+                    reg.fY = ( 0 != ( n & 0x02 ) );
+                    reg.fX = ( 0 != ( n & 0x08 ) );
+                    reg.SetH( reg.H() + 1 );
+                    reg.SetB( reg.B() - 1 );
+                    if ( reg.fZero || ( 0 == reg.B() ) ) // terminating iteration: same rule as cpi
+                        reg.z80_set_memptr( reg.memptr + 1 );
+                    else // pc still points past the ed/op2 bytes; pc-1 is instruction_address+1
+                        reg.z80_set_memptr( pc - 1 );
+                    reg.z80_bump_r(); reg.z80_bump_r(); // each repeat re-examines ed/op2; real hardware bumps r by 2 per iteration
+                    if ( !reg.fZero && ( 0 != reg.B() ) )
+                        modified = z80_block_repeat_self_modified( pc, op2 );
+                } while ( !reg.fZero && ( 0 != reg.B() ) && !modified );
+
+                if ( modified )
+                {
+                    pc -= 2; // it overwrote its own ed/op2 bytes; let the next fetch re-decode them
+                    z80_block_repeat_yx( pc ); // that pass was going to repeat
+                }
+
+                cycles -= 5; // the last iteration is 16T; repeated iterations are 21T
+                reg.fParityEven_Overflow = ( 0 != reg.B() ); // not what the Zilog doc says, but it's what works
+                reg.fCarry = oldCarry; // carry is not affected
+            }
+            else if ( 0xb8 == op2 ) // lddr
+            {
+                cycles = 0;
+                bool modified = false;
+                do
+                {
+                    cycles += 21;
+                    memory[ reg.D() ] = memory[ reg.H() ];
+                    reg.fY = ( 0 != ( ( memory[ reg.H() ] + reg.a ) & 0x02 ) );
+                    reg.fX = ( 0 != ( ( memory[ reg.H() ] + reg.a ) & 0x08 ) );
+                    if ( 1 != reg.B() ) // when bc==1 (the terminating iteration), memptr is unchanged
+                        reg.z80_set_memptr( pc - 1 ); // pc still points past the ed/op2 bytes; pc-1 is instruction_address+1
+                    reg.SetH( reg.H() - 1 );
+                    reg.SetD( reg.D() - 1 );
+                    reg.SetB( reg.B() - 1 );
+                    reg.z80_bump_r(); reg.z80_bump_r(); // each repeat re-examines ed/op2; real hardware bumps r by 2 per iteration
+                    if ( 0 != reg.B() )
+                        modified = z80_block_repeat_self_modified( pc, op2 );
+                } while ( ( 0 != reg.B() ) && !modified );
+
+                if ( modified )
+                {
+                    pc -= 2; // it overwrote its own ed/op2 bytes; let the next fetch re-decode them
+                    z80_block_repeat_yx( pc ); // that pass was going to repeat
+                }
+
+                cycles -= 5; // the last iteration is 16T; repeated iterations are 21T
+                reg.fParityEven_Overflow = ( 0 != reg.B() ); // false on normal completion; true if the repeat was interrupted by self-modification
+                reg.clearHN();
+            }
+            else if ( 0xb9 == op2 ) // cpdr
+            {
+                bool oldCarry = reg.fCarry;
+                cycles = 0;
+                bool modified = false;
+                do
+                {
+                    cycles += 21;
+                    uint8_t memval = memory[ reg.H() ];
+                    op_cmp<true>( memval );
+                    uint8_t n = reg.a - memval - ( reg.fAuxCarry ? 1 : 0 ); // n = A - (HL) - HF
+                    reg.fY = ( 0 != ( n & 0x02 ) );
+                    reg.fX = ( 0 != ( n & 0x08 ) );
+                    reg.SetH( reg.H() - 1 );
+                    reg.SetB( reg.B() - 1 );
+                    if ( reg.fZero || ( 0 == reg.B() ) ) // terminating iteration: same rule as cpd
+                        reg.z80_set_memptr( reg.memptr - 1 );
+                    else // pc still points past the ed/op2 bytes; pc-1 is instruction_address+1
+                        reg.z80_set_memptr( pc - 1 );
+                    reg.z80_bump_r(); reg.z80_bump_r(); // each repeat re-examines ed/op2; real hardware bumps r by 2 per iteration
+                    if ( !reg.fZero && ( 0 != reg.B() ) )
+                        modified = z80_block_repeat_self_modified( pc, op2 );
+                } while ( !reg.fZero && ( 0 != reg.B() ) && !modified );
+
+                if ( modified )
+                {
+                    pc -= 2; // it overwrote its own ed/op2 bytes; let the next fetch re-decode them
+                    z80_block_repeat_yx( pc ); // that pass was going to repeat
+                }
+
+                cycles -= 5; // the last iteration is 16T; repeated iterations are 21T
+                reg.fParityEven_Overflow = ( 0 != reg.B() );
+                reg.fCarry = oldCarry; // carry is not affected
+            }
+            else if ( 0xa2 == op2 ) // ini; no real I/O device attached
+            {
+                // b (not bc) is the loop counter here - unlike ldi/ldir etc,
+                // where bc is a 16-bit counter, c is the fixed port number
+                // for the block I/O group and must not be touched.
+                cycles = 16;
+                memory[ reg.H() ] = 0xff; // matches in r,(c)'s floating-bus convention
+                reg.z80_set_memptr( reg.B() + 1 ); // uses bc before decrementing b
+                reg.SetH( reg.H() + 1 );
+                reg.b = reg.b - 1;
+                z80_block_io_flags( 0xff, (uint8_t) ( reg.c + 1 ) );
+            }
+            else if ( 0xaa == op2 ) // ind; no real I/O device attached
+            {
+                cycles = 16;
+                memory[ reg.H() ] = 0xff;
+                reg.z80_set_memptr( reg.B() - 1 ); // uses bc before decrementing b
+                reg.SetH( reg.H() - 1 );
+                reg.b = reg.b - 1;
+                z80_block_io_flags( 0xff, (uint8_t) ( reg.c - 1 ) );
+            }
+            else if ( 0xa3 == op2 ) // outi; no real I/O device attached
+            {
+                cycles = 16;
+                uint8_t value = memory[ reg.H() ];
+                reg.SetH( reg.H() + 1 );
+                reg.b = reg.b - 1;
+                reg.z80_set_memptr( reg.B() + 1 ); // uses bc after decrementing b
+                z80_block_io_flags( value, (uint8_t) reg.H() );
+            }
+            else if ( 0xab == op2 ) // outd; no real I/O device attached
+            {
+                cycles = 16;
+                uint8_t value = memory[ reg.H() ];
+                reg.SetH( reg.H() - 1 );
+                reg.b = reg.b - 1;
+                reg.z80_set_memptr( reg.B() - 1 ); // uses bc after decrementing b
+                z80_block_io_flags( value, (uint8_t) reg.H() );
+            }
+            else if ( 0xb2 == op2 ) // inir; no real I/O device attached
+            {
+                cycles = 0;
+                bool modified = false;
+                do
+                {
+                    cycles += 21;
+                    memory[ reg.H() ] = 0xff;
+                    reg.z80_set_memptr( reg.B() + 1 ); // exactly as ini: uses bc before decrementing b
+                    reg.SetH( reg.H() + 1 );
+                    reg.b = reg.b - 1;
+                    reg.z80_bump_r(); reg.z80_bump_r(); // each repeat re-examines ed/op2; real hardware bumps r by 2 per iteration
+                    if ( 0 != reg.b )
+                        modified = z80_block_repeat_self_modified( pc, op2 );
+                } while ( ( 0 != reg.b ) && !modified );
+
+                if ( modified )
+                    pc -= 2; // it overwrote its own ed/op2 bytes; let the next fetch re-decode them
+
+                cycles -= 5; // the last iteration is 16T; repeated iterations are 21T
+                z80_block_io_flags( 0xff, (uint8_t) ( reg.c + 1 ) ); // as the last pass's ini/ind
+            }
+            else if ( 0xba == op2 ) // indr; no real I/O device attached
+            {
+                cycles = 0;
+                bool modified = false;
+                do
+                {
+                    cycles += 21;
+                    memory[ reg.H() ] = 0xff;
+                    reg.z80_set_memptr( reg.B() - 1 ); // exactly as ind: uses bc before decrementing b
+                    reg.SetH( reg.H() - 1 );
+                    reg.b = reg.b - 1;
+                    reg.z80_bump_r(); reg.z80_bump_r(); // each repeat re-examines ed/op2; real hardware bumps r by 2 per iteration
+                    if ( 0 != reg.b )
+                        modified = z80_block_repeat_self_modified( pc, op2 );
+                } while ( ( 0 != reg.b ) && !modified );
+
+                if ( modified )
+                    pc -= 2; // it overwrote its own ed/op2 bytes; let the next fetch re-decode them
+
+                cycles -= 5;
+                z80_block_io_flags( 0xff, (uint8_t) ( reg.c - 1 ) ); // as the last pass's ini/ind
+            }
+            else if ( 0xb3 == op2 ) // otir; no real I/O device attached
+            {
+                cycles = 0;
+                bool modified = false;
+                uint8_t value = 0;
+                do
+                {
+                    cycles += 21;
+                    value = memory[ reg.H() ];
+                    reg.SetH( reg.H() + 1 );
+                    reg.b = reg.b - 1;
+                    reg.z80_set_memptr( reg.B() + 1 ); // exactly as outi: uses bc after decrementing b
+                    reg.z80_bump_r(); reg.z80_bump_r(); // each repeat re-examines ed/op2; real hardware bumps r by 2 per iteration
+                    if ( 0 != reg.b )
+                        modified = z80_block_repeat_self_modified( pc, op2 );
+                } while ( ( 0 != reg.b ) && !modified );
+
+                if ( modified )
+                    pc -= 2; // it overwrote its own ed/op2 bytes; let the next fetch re-decode them
+
+                cycles -= 5;
+                z80_block_io_flags( value, (uint8_t) reg.H() ); // as the last pass's outi/outd
+            }
+            else if ( 0xbb == op2 ) // otdr; no real I/O device attached
+            {
+                cycles = 0;
+                bool modified = false;
+                uint8_t value = 0;
+                do
+                {
+                    cycles += 21;
+                    value = memory[ reg.H() ];
+                    reg.SetH( reg.H() - 1 );
+                    reg.b = reg.b - 1;
+                    reg.z80_set_memptr( reg.B() - 1 ); // exactly as outd: uses bc after decrementing b
+                    reg.z80_bump_r(); reg.z80_bump_r(); // each repeat re-examines ed/op2; real hardware bumps r by 2 per iteration
+                    if ( 0 != reg.b )
+                        modified = z80_block_repeat_self_modified( pc, op2 );
+                } while ( ( 0 != reg.b ) && !modified );
+
+                if ( modified )
+                    pc -= 2; // it overwrote its own ed/op2 bytes; let the next fetch re-decode them
+
+                cycles -= 5;
+                z80_block_io_flags( value, (uint8_t) reg.H() ); // as the last pass's outi/outd
+            }
+            else if ( 0x45 == ( op2 & 0xcf ) ) // retn; 0x55/65/75 are undocumented duplicates
+            {
+                cycles = 14;
+                pc = popword( sp );
+                reg.z80_set_memptr( pc );
+            }
+            else if ( 0x4d == ( op2 & 0xcf ) ) // reti; 0x5d/6d/7d are undocumented duplicates
+            {
+                cycles = 14;
+                pc = popword( sp );
+                reg.z80_set_memptr( pc );
+            }
+            else if ( 0x46 == ( op2 & 0xd7 ) ) // im 0; 0x4e/66/6e are undocumented duplicates
+                cycles = 8;
+            else if ( 0x56 == ( op2 & 0xdf ) ) // im 1; 0x76 is an undocumented duplicate
+                cycles = 8;
+            else if ( 0x5e == ( op2 & 0xdf ) ) // im 2; 0x7e is an undocumented duplicate
+                cycles = 8;
+            else if ( 0x42 == ( op2 & 0xcf ) ) // sbc hl, rp AKA sbc hl, ss
+            {
+                cycles = 15;
+                uint8_t rp = ( 0x3 & ( op2 >> 4 ) );
+                uint16_t val = ( 3 == rp ) ? sp : * reg.rpAddressFromOp( op2 );
+                uint16_t oldH = reg.H();
+                reg.SetH( z80_op_sub_16( oldH, val, reg.fCarry ) );
+                reg.z80_set_memptr( oldH + 1 );
+            }
+            else if ( 0x40 == ( op2 & 0xc7 ) ) // in r,(c); rm==6 is the undocumented flags-only variant
+            {
+                cycles = 12;
+                uint8_t val = 0xff; // no real I/O device attached; typical floating-bus value
+                uint8_t rm = 7 & ( op2 >> 3 );
+                if ( 6 != rm )
+                    * dst_address_rm( rm ) = val;
+                set_sign_zero_parity( val );
+                reg.clearHN();
+                reg.z80_assignYX( val );
+                reg.z80_set_memptr( reg.B() + 1 );
+            }
+            else if ( 0x41 == ( op2 & 0xc7 ) ) // out (c),r; no real I/O device attached
+            {
+                cycles = 12;
+                reg.z80_set_memptr( reg.B() + 1 );
+            }
+            else // any other ed-prefixed byte is undefined and acts as two nops (r is already +2 for the prefix+op2 fetch)
+                cycles = 8;
+            break;
+        }
+        default:
+            z80_ni( op, memory[ pc ] );
+    }
+
+    return cycles;
+} //z80_emulate
+
+void z80_renderByteReg( char * acfrom, uint8_t op, uint8_t fromval )
+{
+    memset( acfrom, 0, 4 );
+    assert( 0xdd == op || 0xfd == op );
+    assert( fromval <= 7 );
+    if ( fromval < 4 )
+        acfrom[ 0 ] = 'b' + fromval;
+    else if ( 7 == fromval )
+        acfrom[0] = 'a';
+    else
+        snprintf( acfrom, 4, "%s%c", 0xdd == op ? "ix" : "iy", 4 == fromval ? 'h' : 'l' );
+} //z80_renderByteReg
+
+void z80_render( char * ac, size_t bufferSize, uint8_t op, uint16_t address )
+{
+    // Keep the renderer aligned with the execution decoder: repeated or
+    // mixed DD/FD prefixes are one instruction and the last prefix selects
+    // IX or IY.  Leave address pointing at that final effective prefix so
+    // the existing op2/op3/op4 offsets remain valid.
+    if ( 0xdd == op || 0xfd == op )
+    {
+        uint8_t next = memory[ (uint16_t) ( address + 1 ) ];
+        while ( 0xdd == next || 0xfd == next )
+        {
+            address++;
+            op = next;
+            next = memory[ (uint16_t) ( address + 1 ) ];
+        }
+    }
+
+    uint8_t op2 = memory[ address + 1 ];
+    uint8_t op3 = memory[ address + 2 ];
+    uint8_t op4 = memory[ address + 3 ];
+    uint16_t op34 = (uint16_t) op3 + ( (uint16_t) op4 << 8 );
+    int16_t op2int = (int16_t) (int8_t) op2;
+    int16_t op3int = (int16_t) (int8_t) op3;
+    snprintf( ac, bufferSize, "z80 %02x %02x %02x NYI", op, op2, op3 );
+
+    if ( 0xdd == op || 0xfd == op ) // ix & iy operations
+    {
+        const char * i = ( 0xdd == op ) ? "ix" : "iy";
+
+        if ( 0x46 == ( op2 & 0xc7 ) ) // must include bit 7; see the matching fix in z80_emulate
+        {
+            uint8_t src = ( ( op2 >> 3 ) & 0x7 );
+            snprintf( ac, bufferSize, "ld %s, (%s%s%d)", reg_strings[ src ], i, op3int >= 0 ? "+" : "", op3int );
+        }
+        else if ( 0x70 == ( op2 & 0xf8 ) )
+        {
+            uint8_t src = op2 & 0x7;
+            if ( 6 == src )
+                snprintf( ac, bufferSize, "ld (%s%s%d), %02x", i, op3int >= 0 ? "+" : "", op3int, op4 );
+            else
+                snprintf( ac, bufferSize, "ld (%s%s%d), %s", i, op3int >= 0 ? "+" : "", op3int, reg_strings[ src ] );
+        }
+        else if ( 0x09 == ( op2 & 0xcf ) )
+            snprintf( ac, bufferSize, "add %s, %s", i, rp_strings[ ( op2 >> 4 ) & 0x3 ] );
+        else if ( 0x21 == op2 )
+            snprintf( ac, bufferSize, "ld %s, %04xh", i, op34 );
+        else if ( 0x22 == op2 )
+            snprintf( ac, bufferSize, "ld (%04xh), %s", op34, i );
+        else if ( 0x23 == op2 )
+            snprintf( ac, bufferSize, "inc %s", i );
+        else if ( 0x26 == op2 )
+            snprintf( ac, bufferSize, "ld %sh, %02x", i, op3 );
+        else if ( 0x2a == op2 )
+            snprintf( ac, bufferSize, "ld %s, (%04xh)", i, op34 );
+        else if ( 0x2b == op2 )
+            snprintf( ac, bufferSize, "dec %s", i );
+        else if ( 0x2e == op2 )
+            snprintf( ac, bufferSize, "ld %sl, %02x", i, op3 );
+        else if ( 0x34 == op2 )
+            snprintf( ac, bufferSize, "inc (%s%s%d)", i, op3int >= 0 ? "+" : "", op3int );
+        else if ( 0x35 == op2 )
+            snprintf( ac, bufferSize, "dec (%s%s%d)", i, op3int >= 0 ? "+" : "", op3int );
+        else if ( 0x36 == op2 )
+            snprintf( ac, bufferSize, "ld (%s%s%d), %02xh", i, op3int >= 0 ? "+" : "", op3int, op4 );
+        else if ( ( op2 >= 0x40 && op2 <= 0x6f ) || ( op2 >= 0x78 && op2 <= 0x7f ) )
+        {
+            char acto[ 4 ] = {0};
+            char acfrom[ 4 ] = {0};
+            uint8_t fromval = op2 & 0xf;
+            if ( fromval >= 8 )
+                fromval -= 8;
+            z80_renderByteReg( acfrom, op, fromval );
+
+            if ( op2 <= 0x47 )
+                acto[0] = 'b';
+            else if ( op2 <= 0x4f )
+                acto[0] = 'c';
+            else if ( op2 <= 0x57 )
+                acto[0] = 'd';
+            else if ( op2 <= 0x5f )
+                acto[0] = 'e';
+            else if ( op2 <= 0x67 )
+                snprintf( acto, _countof( acto ), "%sh", i );
+            else if ( op2 <= 0x6f )
+                snprintf( acto, _countof( acto ), "%sl", i );
+            else
+                acto[0] = 'a';
+
+            snprintf( ac, bufferSize, "ld %s, %s", acto, acfrom );
+        }
+        else if ( 0x2a == op2 )
+            snprintf( ac, bufferSize, "ld %s, (%04x)", i, op34 );
+        else if ( 0x22 == op2 )
+            snprintf( ac, bufferSize, "ld (%04x), %s", op34, i );
+        else if ( 0x84 == ( op2 & 0xc6 ) ) // math on ixh/ixl/iyh/iyl with a; see the matching fix in z80_emulate
+        {
+            uint8_t math = ( ( op2 >> 3 ) & 0x7 );
+            snprintf( ac, bufferSize, "%s a, %s%c", z80_math_strings[ math ], i, ( op2 & 1 ) ? 'l' : 'h' );
+        }
+        else if ( 0x86 == ( op2 & 0xc7 ) ) // math on [ ix/iy + index ]. 86, 8e, 96, 9e, a6, ae, b6, be
+        {
+            uint8_t math = ( ( op2 >> 3 ) & 0x7 );
+            snprintf( ac, bufferSize, "%s a, (%s%s%d)", z80_math_strings[ math ], i, op3int >=0 ? "+" : "", op3int );
+        }
+        else if ( 0xcb == op2 && ( op4 <= 0x3f ) )
+        {
+            uint8_t rot = ( ( op4 >> 3 ) & 0x7 );
+            int offset = (int) (int8_t) op3;
+            snprintf( ac, bufferSize, "%s %s, (%s%s%d)", z80_rotate_strings[ rot ], reg_strings[ op4 & 0x7 ], i, offset >= 0 ? "+" : "", offset );
+        }
+        else if ( 0xcb == op2 && ( ( ( op4 & 0xf ) == 0xe ) || ( ( op4 & 0xf ) == 0x6 ) ) ) // bit operations on indexed memory
+        {
+            uint8_t index = op3;
+            int32_t index32 = (int32_t) (int8_t) index;
+            uint8_t mod = op4;
+            uint8_t bit = ( mod >> 3 ) & 0x7;
+            uint8_t top2bits = mod & 0xc0;
+
+            if ( 0x40 == top2bits ) // bit
+                snprintf( ac, bufferSize, "bit %u, (%s%s%d)", bit, i, index32 >= 0 ? "+" : "", index32 );
+            else if ( 0x80 == top2bits ) // reset
+                snprintf( ac, bufferSize, "res %u, (%s%s%d)", bit, i, index32 >= 0 ? "+" : "", index32 );
+            else if ( 0xc0 == top2bits ) // set
+                snprintf( ac, bufferSize, "set %u, (%s%s%d)", bit, i, index32 >= 0 ? "+" : "", index32 );
+            else if ( 0x26 == op4 ) // sla
+                snprintf( ac, bufferSize, "sla (%s%s%d)", i, index32 >= 0 ? "+" : "", index32 );
+            else if ( 0x2e == op4 ) // sra
+                snprintf( ac, bufferSize, "sra (%s%s%d)", i, index32 >= 0 ? "+" : "", index32 );
+            else if ( 0x3e == op4 ) // srl
+                snprintf( ac, bufferSize, "srl (%s%s%d)", i, index32 >= 0 ? "+" : "", index32 );
+            else if ( 0x00 == top2bits ) // rlc/rl/rrc/rl rotate of (i + index)
+            {
+                const char * pc = "n/a";
+                if ( 0x06 == op4 )
+                    pc = "rlc";
+                else if ( 0x0e == op4 )
+                    pc = "rrc";
+                else if ( 0x16 == op4 )
+                    pc = "rl";
+                else if ( 0x1e == op4 )
+                    pc = "rr";
+                snprintf( ac, bufferSize, "%s (%s%s%d)", pc, i, index32 >= 0 ? "+" : "", index32 );
+            }
+        }
+        else if ( 0xe1 == op2 )
+            snprintf( ac, bufferSize, "pop %s", i );
+        else if ( 0xe3 == op2 )
+            snprintf( ac, bufferSize, "ex (sp), %s", i );
+        else if ( 0xe5 == op2 )
+            snprintf( ac, bufferSize, "push %s", i );
+        else if ( 0xe9 == op2 )
+            snprintf( ac, bufferSize, "jp (%s)", i );    // this official syntax is bad; it's not indirect
+        else if ( 0xf9 == op2 )
+            snprintf( ac, bufferSize, "ld sp, %s", i );
+        else
+            snprintf( ac, bufferSize, "unknown 0xdd / 0xfd instruction, op2 %2x", op2 );
+    }
+    else if ( 0xed == op ) // load and compare operations
+    {
+        if ( 0x4b == ( op2 & 0xcf ) )
+        {
+            uint8_t rp = ( ( op2 >> 4 ) & 3 );
+            snprintf( ac, bufferSize, "ld %s, (%04xh)", rp_strings[ rp ], op34 );
+        }
+        else if ( 0x43 == ( op2 & 0xcf ) )
+        {
+            uint8_t rp = ( ( op2 >> 4 ) & 3 );
+            snprintf( ac, bufferSize, "ld (%04xh), %s", op34, rp_strings[ rp ] );
+        }
+        else if ( 0x44 == ( op2 & 0xc7 ) ) // neg; 4c/54/5c/64/6c/74/7c are undocumented duplicates
+            strcpy( ac, "neg" );
+        else if ( 0x47 == op2 )
+            snprintf( ac, bufferSize, "ld i, a" );
+        else if ( 0x4f == op2 )
+            snprintf( ac, bufferSize, "ld r, a" );
+        else if ( 0x57 == op2 )
+            snprintf( ac, bufferSize, "ld a, i" );
+        else if ( 0x5f == op2 )
+            snprintf( ac, bufferSize, "ld a, r" );
+        else if ( 0x67 == op2 )
+            strcpy( ac, "rrd" );
+        else if ( 0x6f == op2 )
+            strcpy( ac, "rld" );
+        else if ( 0xa0 == op2 )
+            strcpy( ac, "ldi" );
+        else if ( 0xa8 == op2 )
+            strcpy( ac, "ldd" );
+        else if ( 0xb0 == op2 )
+            strcpy( ac, "ldir" );
+        else if ( 0xb8 == op2 )
+            strcpy( ac, "lddr" );
+        else if ( 0x02 == ( op2 & 0x8f ) )
+        {
+            uint8_t rp = ( ( ( op2 & 0x30 ) >> 4 ) & 3 );
+            snprintf( ac, bufferSize, "sbc hl, %s", rp_strings[ rp ] );
+        }
+        else if ( 0x4a == ( op2 & 0xcf ) ) // adc hl, rp
+        {
+            uint8_t rp = ( ( op2 >> 4 ) & 3 );
+            snprintf( ac, bufferSize, "adc hl, %s", rp_strings[ rp ] );
+        }
+        else if ( 0xa1 == op2 )
+            strcpy( ac, "cpi" );
+        else if ( 0xa9 == op2 )
+            strcpy( ac, "cpd" );
+        else if ( 0xb1 == op2 )
+            strcpy( ac, "cpir" );
+        else if ( 0xb9 == op2 )
+            strcpy( ac, "cpdr" );
+        else if ( 0xa2 == op2 )
+            strcpy( ac, "ini" );
+        else if ( 0xaa == op2 )
+            strcpy( ac, "ind" );
+        else if ( 0xa3 == op2 )
+            strcpy( ac, "outi" );
+        else if ( 0xab == op2 )
+            strcpy( ac, "outd" );
+        else if ( 0xb2 == op2 )
+            strcpy( ac, "inir" );
+        else if ( 0xba == op2 )
+            strcpy( ac, "indr" );
+        else if ( 0xb3 == op2 )
+            strcpy( ac, "otir" );
+        else if ( 0xbb == op2 )
+            strcpy( ac, "otdr" );
+        else if ( 0x45 == ( op2 & 0xcf ) ) // retn; 55/65/75 are undocumented duplicates
+            strcpy( ac, "retn" );
+        else if ( 0x4d == ( op2 & 0xcf ) ) // reti; 5d/6d/7d are undocumented duplicates
+            strcpy( ac, "reti" );
+        else if ( 0x46 == ( op2 & 0xd7 ) ) // im 0; 4e/66/6e are undocumented duplicates
+            strcpy( ac, "im 0" );
+        else if ( 0x56 == ( op2 & 0xdf ) ) // im 1; 76 is an undocumented duplicate
+            strcpy( ac, "im 1" );
+        else if ( 0x5e == ( op2 & 0xdf ) ) // im 2; 7e is an undocumented duplicate
+            strcpy( ac, "im 2" );
+        else if ( 0x40 == ( op2 & 0xc7 ) ) // in r,(c); rm==6 is the undocumented flags-only variant
+        {
+            uint8_t rm = 7 & ( op2 >> 3 );
+            if ( 6 == rm )
+                strcpy( ac, "in (c)" );
+            else
+                snprintf( ac, bufferSize, "in %s, (c)", reg_strings[ rm ] );
+        }
+        else if ( 0x41 == ( op2 & 0xc7 ) ) // out (c),r; rm==6 is the undocumented flags-only variant
+        {
+            uint8_t rm = 7 & ( op2 >> 3 );
+            if ( 6 == rm )
+                strcpy( ac, "out (c), 0" );
+            else
+                snprintf( ac, bufferSize, "out (c), %s", reg_strings[ rm ] );
+        }
+    }
+    else if ( 0xcb == op ) // rotate / bits. There is no sll in documented Z80
+    {
+        if ( 0x20 == ( op2 & 0xf8 ) ) // sla = shift left arithmetic
+        {
+            uint8_t rm = op2 & 0x7;
+            snprintf( ac, bufferSize, "sla %s", reg_strings[ rm ] );
+        }
+        else if ( 0x28 == ( op2 & 0xf8 ) ) // sra = shift right arithmetic
+        {
+            uint8_t rm = op2 & 0x7;
+            snprintf( ac, bufferSize, "sra %s", reg_strings[ rm ] );
+        }
+        else if ( op2 >= 0x30 && op2 <= 0x3f )
+        {
+            uint8_t rm = op2 & 0x7;
+            if ( op2 <= 0x37 )
+                snprintf( ac, bufferSize, "sll %s", reg_strings[ rm ] );
+            else
+                snprintf( ac, bufferSize, "srl %s", reg_strings[ rm ] );
+        }
+        else if ( 0x38 == ( op2 & 0xf8 ) ) // srl = shift right logical
+        {
+            uint8_t rm = op2 >> 4;
+            snprintf( ac, bufferSize, "srl %s", reg_strings[ rm ] );
+        }
+        else if ( op2 <= 0x1f ) // rlc, rl, rrc, rr on rm
+        {
+            const char * rotateType = "rlc";
+            if ( op2 >= 0x10 && op2 <= 0x17 )
+                rotateType = "rl";
+            else if ( op2 >= 0x08 && op2 <= 0x0f )
+                rotateType = "rrc";
+            else if ( op2 >= 0x18 && op2 <= 0x1f )
+                rotateType = "rr";
+
+            uint8_t rm = ( op2 & 0x7 );
+            snprintf( ac, bufferSize, "%s %s", rotateType, reg_strings[ rm ] );
+        }
+        else if ( op2 >= 0x40 && op2 <= 0x7f ) // bit #, rm
+        {
+            uint8_t rm = op2 & 0x7;
+            uint8_t bit = ( op2 >> 3 ) & 0x7;
+            snprintf( ac, bufferSize, "bit %u, %s", bit, reg_strings[ rm ] );
+        }
+        else if ( op2 >= 0x80 && op2 <= 0xbf ) // res bit #, rm
+        {
+            uint8_t rm = op2 & 0x7;
+            uint8_t bit = ( op2 >> 3 ) & 0x7;
+            snprintf( ac, bufferSize, "res %u, %s", bit, reg_strings[ rm ] );
+        }
+        else if ( op2 >= 0xc0 && op2 <= 0xff ) // set bit #, rm
+        {
+            uint8_t rm = op2 & 0x7;
+            uint8_t bit = ( op2 >> 3 ) & 0x7;
+            snprintf( ac, bufferSize, "set %u, %s", bit, reg_strings[ rm ] );
+        }
+    }
+    else if ( 0x08 == op )
+        strcpy( ac, "ex af,af'" );
+    else if ( 0x10 == op )
+        snprintf( ac, bufferSize, "djnz %d", op2int );
+    else if ( 0x18 == op )
+        snprintf( ac, bufferSize, "jr %d", op2int );
+    else if ( 0x20 == op )
+        snprintf( ac, bufferSize, "jr nz, %d", op2int );
+    else if ( 0x28 == op )
+        snprintf( ac, bufferSize, "jr z, %d", op2int );
+    else if ( 0x30 == op )
+        snprintf( ac, bufferSize, "jr nc, %d", op2int );
+    else if ( 0x38 == op )
+        snprintf( ac, bufferSize, "jr c, %d", op2int );
+    else if ( 0xd9 == op )
+        strcpy( ac, "exx" );
+    else
+        strcpy( ac, "unknown instruction" );
+} //z80_render
+
+void replace_with_num( char * pc, const char * psearch, uint16_t num, uint8_t width )
+{
+    char actemp[ 60 ];
+    snprintf( actemp, _countof( actemp ), ( 16 == width ) ? "%04xh" : "%02xh", (uint32_t) num );
+    strcat( actemp, pc + strlen( psearch ) );
+    strcpy( pc, actemp );
+} //replace_with_num
+
+template <bool Z80Mode> const char * x80_render_operation_impl( uint16_t address )
+{
+    static char ac[ 60 ];
+    uint8_t op = memory[ address ];
+    bool renderData = true;
+
+    if ( Z80Mode )
+    {
+        strcpy( ac, z80_instructions[ op ] );
+        if ( '*' == ac[ 0 ] )
+        {
+            z80_render( ac, _countof( ac ), op, address );
+            renderData = false;
+        }
+    }
+    else
+        strcpy( ac, i8080_instructions[ op ] );
+
+    if ( renderData )
+    {
+        char * p;
+        if ( ( p = strstr( ac, "d16" ) ) )
+            replace_with_num( p, "d16", mword( address + 1 ), 16 );
+        else if ( ( p = strstr( ac, "a16" ) ) )
+            replace_with_num( p, "a16", mword( address + 1 ), 16 );
+        else if ( ( p = strstr( ac, "d8" ) ) )
+            replace_with_num( p, "d8", memory[ address + 1 ], 8 );
+    }
+
+    return ac;
+} //x80_render_operation_impl
+
+const char * x80_render_operation( uint16_t address )
+{
+    if ( reg.fZ80Mode )
+        return x80_render_operation_impl<true>( address );
+    return x80_render_operation_impl<false>( address );
+} //x80_render_operation
+
+uint8_t x80_instruction_length( uint16_t address )
+{
+    uint8_t op = memory[ address ];
+    const char * instruction;
+
+    if ( !reg.fZ80Mode )
+    {
+        instruction = i8080_instructions[ op ];
+        return strstr( instruction, "d16" ) || strstr( instruction, "a16" ) ? 3 :
+               ( strstr( instruction, "d8" ) ? 2 : 1 );
+    }
+
+    if ( op == 0xcb )
+        return 2;
+    if ( op == 0xed )
+    {
+        uint8_t op2 = memory[ (uint16_t) ( address + 1 ) ];
+        return ( op2 & 0x0f ) == 0x0b || ( op2 & 0x0f ) == 0x03 ? 4 : 2;
+    }
+    if ( op == 0xdd || op == 0xfd )
+    {
+        uint8_t extra_prefixes = 0;
+        uint8_t op2 = memory[ (uint16_t) ( address + 1 ) ];
+        while ( op2 == 0xdd || op2 == 0xfd )
+        {
+            extra_prefixes++;
+            address++;
+            op2 = memory[ (uint16_t) ( address + 1 ) ];
+        }
+        if ( op2 == 0xcb || op2 == 0x21 || op2 == 0x22 || op2 == 0x2a || op2 == 0x36 )
+            return 4 + extra_prefixes;
+        if ( ( op2 & 0x47 ) == 0x46 || ( op2 & 0xf8 ) == 0x70 ||
+             ( op2 & 0xc7 ) == 0x86 || op2 == 0x34 || op2 == 0x35 ||
+             op2 == 0x26 || op2 == 0x2e )
+            return 3 + extra_prefixes;
+        return 2 + extra_prefixes;
+    }
+
+    instruction = z80_instructions[ op ];
+    if ( strstr( instruction, "d16" ) || strstr( instruction, "a16" ) )
+        return 3;
+    if ( strstr( instruction, "d8" ) || op == 0x10 || op == 0x18 ||
+         op == 0x20 || op == 0x28 || op == 0x30 || op == 0x38 )
+        return 2;
+    return 1;
+} //x80_instruction_length
+
+// shared (not per-template-instantiation) so a build with both Z80 and 8080
+// trace paths compiled in still tracks "did the function change" as one
+// stream of instructions, the same way m68000.cxx's trace_state() does.
+static const char * g_previous_trace_symbol = 0;
+
+template <bool Z80Mode> not_inlined void x80_trace_state_impl()
+{
+    if ( !tracer.IsEnabled() ) // trace instructions may be on but global tracing turned off
+        return;
+
+    uint8_t op = memory[ reg.pc ];
+    uint8_t op2 = memory[ reg.pc + 1 ];
+    uint8_t op3 = memory[ reg.pc + 2 ];
+    uint8_t op4 = memory[ reg.pc + 3 ];
+
+#ifndef WATCOMDOS
+
+    // only trace the function name when it changes vs. the last traced
+    // instruction (i.e. after a branch, call, return, or fall-through into
+    // a new function) - not on every straight-line instruction.
+    uint16_t symbol_offset;
+    const char * symbol_name = emulator_symbol_lookup( reg.pc, symbol_offset );
+    if ( symbol_name == g_previous_trace_symbol )
+        symbol_name = "";
+    else
+        g_previous_trace_symbol = symbol_name;
+
+    if ( 0 != symbol_name[ 0 ] )
+    {
+        if ( 0 != symbol_offset )
+            tracer.Trace( "%s + %x:\n", symbol_name, symbol_offset );
+        else
+            tracer.Trace( "%s:\n", symbol_name );
+    }
+
+#endif
+
+    if ( Z80Mode )
+        tracer.Trace( "pc %04x, op %02x, op2 %02x, op3 %02x, op4 %02x, a %02x, B %04x, D %04x, H %04x, ix %04x, iy %04x, sp %04x, %s, %s\n",
+                      reg.pc, op, op2, op3, op4, reg.a, reg.B(), reg.D(), reg.H(), reg.ix, reg.iy, reg.sp,
+                      reg.renderFlags<Z80Mode>(), x80_render_operation_impl<Z80Mode>( reg.pc ) );
+    else
+        tracer.Trace( "pc %04x, op %02x, op2 %02x, op3 %02x, a %02x, B %04x, D %04x, H %04x, sp %04x, %s, %s\n",
+                      reg.pc, op, op2, op3, reg.a, reg.B(), reg.D(), reg.H(), reg.sp,
+                      reg.renderFlags<Z80Mode>(), x80_render_operation_impl<Z80Mode>( reg.pc ) );
+
+//    tracer.TraceBinaryData( & memory[ 0x42c5 + 0x16 ], 2, 4 );
+} //x80_trace_state_impl
+
+not_inlined void x80_trace_state()
+{
+    if ( reg.fZ80Mode )
+        x80_trace_state_impl<true>();
+    else
+        x80_trace_state_impl<false>();
+} //x80_trace_state
+
+bool check_conditional( uint8_t op ) // checks for conditional jump, call, and return
+{
+    bool condition = reg.getFlag( ( op >> 4 ) & 3 );
+    if ( ( 0 == ( op & 8 ) ) )
+        condition = !condition;
+
+    return condition;
+} //check_conditional
+
+template <bool Z80Mode> not_inlined bool handle_state( uint32_t cycles ) // this code exists to reduce what would be multiple checks per instruction loop to just one check
+{
+    if ( g_State & stateEndEmulation )
+        return true;
+
+    if ( g_State & stateTraceInstructions )
+        x80_trace_state_impl<Z80Mode>();
+
+    if ( g_State & stateProfile )
+    {
+        if ( cycles >= g_profileLastCycles )
+            g_pcHits[ g_profileLastPC ] += ( cycles - g_profileLastCycles );
+        g_profileLastPC = reg.pc;
+        g_profileLastCycles = cycles;
+    }
+
+    return false;
+} //handle_state
+
+#define RETURN_INSTRUCTION_COUNT 0
+
+template <bool Z80Mode> static uint32_t x80_emulate_impl( uint16_t maxcycles )
+{
+    uint32_t cycles = 0;
+#if RETURN_INSTRUCTION_COUNT
+    uint16_t instructions = 0;
+#endif
+
+    // pc/sp are kept here as locals (rather than read/written through reg.pc/reg.sp on
+    // every touch) so the hot path can keep them in host registers instead of paying a
+    // memory round trip on every fetch/jump/call/push/pop - by far the most frequently
+    // touched pieces of CPU state. Anything called out of this loop that might read or
+    // write pc/sp (handle_state, x80_invoke_hook, z80_emulate) gets reg.pc/reg.sp synced
+    // immediately before and reloaded immediately after, so those calls always see - and
+    // any changes they make are always reflected in - accurate state. reg.pc/reg.sp is
+    // re-synced from the locals at every exit from this function (see _all_done below).
+    uint16_t pc = reg.pc;
+    uint16_t sp = reg.sp;
+#if Z80_ZILOG_SCF_CCF
+    uint16_t currentStart = reg.z80LastStart; // this instruction's start; reg.z80PreviousStart has the last one's
+#endif
+
+    // with the Watcom compiler for real-mode DOS, the cycle check, cycle addition, and trace check consume 17% of runtime
+
+    while ( cycles < maxcycles )        // 4% of runtime checking if we're done
+    {
+        if ( 0 != g_State )
+        {
+            reg.pc = pc;
+            reg.sp = sp;
+            bool stop = handle_state<Z80Mode>( cycles );
+            pc = reg.pc;
+            sp = reg.sp;
+            if ( stop )
+                break;
+        }
+
+#if Z80_ZILOG_SCF_CCF
+        if ( Z80Mode )
+        {
+            reg.z80PreviousStart = currentStart;
+            currentStart = pc;
+        }
+#endif
+        uint8_t op = memory[ pc ];      // 1% of runtime
+        pc++;                            // 7% of runtime
+        cycles += Z80Mode ? z80_cycles[ op ] : i8080_cycles[ op ];
+#if RETURN_INSTRUCTION_COUNT
+        instructions++;
+#endif
+
+        switch ( op )                   // 50% of runtime is completing cycle addition & setting up for the jump table jump
+        {
+            case 0x00: break; // nop
+            case 0x01: case 0x11: case 0x21: { * reg.rpAddressFromLowOp( op ) = pcword( pc ); break; } // lxi bc/de/hl, d16
+            case 0x31: { sp = pcword( pc ); break; } // lxi sp, d16
+            case 0x02: { memory[ reg.B() ] = reg.a; reg.z80_set_memptr( ( (uint16_t) reg.a << 8 ) | ( ( reg.B() + 1 ) & 0xff ) ); break; } // stax b
+            case 0x03: case 0x13: case 0x23: // inx bc/de/hl. no status flag updates
+            {
+                uint16_t * pdst = reg.rpAddressFromLowOp( op );
+                *pdst = 1 + *pdst;
+                break;
+            }
+            case 0x33: { sp = sp + 1; break; } // inx sp
+            case 0x04: case 0x14: case 0x24: case 0x34: case 0x0c: case 0x1c: case 0x2c: case 0x3c: // inr rm. does not set carry
+            {
+                uint8_t * pdst = dst_address( op );
+                *pdst = op_inc<Z80Mode>( *pdst );
+                break;
+            }
+            case 0x05: case 0x15: case 0x25: case 0x35: case 0x0d: case 0x1d: case 0x2d: case 0x3d: // dcr rm. does not set carry
+            {
+                uint8_t * pdst = dst_address( op );
+                *pdst = op_dec<Z80Mode>( * pdst );          // 5% of runtime
+                break;
+            }
+            case 0x06: case 0x16: case 0x26: case 0x36: case 0x0e: case 0x1e: case 0x2e: case 0x3e: // mvi rm, d8
+            {
+                * dst_address( op ) = pcbyte( pc );
+                break;
+            }
+            case 0x07: // rlc
+            {
+                reg.fCarry = ( 0 != ( reg.a & 0x80 ) );
+                reg.a <<= 1;
+                if ( reg.fCarry )
+                    reg.a |= 1;
+                if ( Z80Mode )
+                {
+                    reg.clearHN();
+                    reg.z80_assignYX( reg.a );
+                }
+                break;
+            }
+            case 0x09: case 0x19: case 0x29: { op_dad<Z80Mode>( * reg.rpAddressFromOp( op ) ); break; } // dad bc/de/hl
+            case 0x39: { op_dad<Z80Mode>( sp ); break; } // dad sp
+            case 0x0a: { reg.z80_set_memptr( reg.B() + 1 ); reg.a = memory[ reg.B() ]; break; } // ldax b
+            case 0x0b: case 0x1b: case 0x2b: // dcx bc/de/hl. no status flag updates
+            {
+                uint16_t * pdst = reg.rpAddressFromOp( op );
+                *pdst = *pdst - 1;
+                break;
+            }
+            case 0x3b: { sp = sp - 1; break; } // dcx sp
+            case 0x0f: // rrc
+            {
+                reg.fCarry = ( 0 != ( reg.a & 1 ) );
+                reg.a >>= 1;
+                if ( reg.fCarry )
+                    reg.a |= 0x80;
+                if ( Z80Mode )
+                {
+                    reg.clearHN();
+                    reg.z80_assignYX( reg.a );
+                }
+                break;
+            }
+            case 0x12: { memory[ reg.D() ] = reg.a; reg.z80_set_memptr( ( (uint16_t) reg.a << 8 ) | ( ( reg.D() + 1 ) & 0xff ) ); break; } // stax d
+            case 0x17: // ral
+            {
+                bool c = reg.fCarry;
+                reg.fCarry = ( 0 != ( 0x80 & reg.a ) );
+                reg.a <<= 1;
+                if ( c )
+                    reg.a |= 1;
+                if ( Z80Mode )
+                {
+                    reg.clearHN();
+                    reg.z80_assignYX( reg.a );
+                }
+                break;
+            }
+            case 0x1a: { reg.z80_set_memptr( reg.D() + 1 ); reg.a = memory[ reg.D() ]; break; } // ldax d
+            case 0x1f: // rar
+            {
+                bool c = reg.fCarry;
+                reg.fCarry = ( 0 != ( reg.a & 1 ) );
+                reg.a >>= 1;
+                if ( c )
+                    reg.a |= 0x80;
+                if ( Z80Mode )
+                {
+                    reg.clearHN();
+                    reg.z80_assignYX( reg.a );
+                }
+                break;
+            }
+            case 0x22: { uint16_t addr = pcword( pc ); setmword( addr, reg.H() ); reg.z80_set_memptr( addr + 1 ); break; } // shld
+            case 0x27: { op_daa<Z80Mode>(); break; } // daa
+            case 0x2a: { uint16_t addr = pcword( pc ); reg.SetH( mword( addr ) ); reg.z80_set_memptr( addr + 1 ); break; } // lhld
+            case 0x2f: { op_cma<Z80Mode>(); break; } // cma
+            case 0x32: { uint16_t addr = pcword( pc ); memory[ addr ] = reg.a; reg.z80_set_memptr( ( (uint16_t) reg.a << 8 ) | ( ( addr + 1 ) & 0xff ) ); break; } // sta a16
+            case 0x37: // stc
+            {
+                reg.fCarry = 1;
+                if ( Z80Mode )
+                {
+                    reg.clearHN();
+#if Z80_ZILOG_SCF_CCF
+                    reg.z80_assignYX( z80_scf_ccf_yx( reg.z80PreviousStart ) );
+#else
+                    reg.z80_assignYX( reg.a );
+#endif
+                }
+                break;
+            }
+            case 0x3a: { uint16_t addr = pcword( pc ); reg.a = memory[ addr ]; reg.z80_set_memptr( addr + 1 ); break; } // lda a16
+            case 0x3f: // cmc
+            {
+#if Z80_ZILOG_SCF_CCF
+                uint8_t yx = Z80Mode ? z80_scf_ccf_yx( reg.z80PreviousStart ) : 0;
+                op_cmc<Z80Mode>();
+                if ( Z80Mode )
+                    reg.z80_assignYX( yx );
+#else
+                op_cmc<Z80Mode>();
+#endif
+                break;
+            }
+            case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47: // mov
+            case 0x48: case 0x49: case 0x4a: case 0x4b: case 0x4c: case 0x4d: case 0x4e: case 0x4f:
+            case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57:
+            case 0x58: case 0x59: case 0x5a: case 0x5b: case 0x5c: case 0x5d: case 0x5e: case 0x5f:
+            case 0x60: case 0x61: case 0x62: case 0x63:            case 0x65: case 0x66: case 0x67:
+            case 0x68: case 0x69: case 0x6a: case 0x6b: case 0x6c: case 0x6d: case 0x6e: case 0x6f:
+            case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75:            case 0x77:
+            case 0x78: case 0x79: case 0x7a: case 0x7b: case 0x7c: case 0x7d: case 0x7e: case 0x7f:
+            {
+                * dst_address( op ) = src_value( op );
+                break;
+            }
+            case 0x64: // hook
+            {
+                reg.pc = pc;    // hook (BDOS/BIOS dispatch) may read and/or change pc/sp
+                reg.sp = sp;    // (e.g. warm boot, buffered console read ending the run)
+                op = x80_invoke_hook();
+                pc = reg.pc;
+                sp = reg.sp;
+                cycles += Z80Mode ? z80_cycles[ op ] : i8080_cycles[ op ];
+                if ( OPCODE_HLT == op ) // treat each possible return opcode separately to avoid a jump to restart for performance
+                    goto _op_hlt;
+                else if ( OPCODE_NOP == op )
+                    break;
+                else if ( OPCODE_RET == op )
+                    goto _op_ret;
+                else if ( OPCODE_HOOK == op ) // not a BDOS or BIOS hook: a real mov h, h
+                {
+                    cycles += Z80Mode ? 4 : 5;
+                    break;
+                }
+                else
+                    assert( false );
+            }
+            case 0x76: { _op_hlt: x80_invoke_halt(); goto _all_done; } // hlt
+            case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0x85: case 0x86: case 0x87: { op_add<Z80Mode>( src_value( op ) ); break; }
+            case 0x88: case 0x89: case 0x8a: case 0x8b: case 0x8c: case 0x8d: case 0x8e: case 0x8f: { op_adc<Z80Mode>( src_value( op ) ); break; }
+            case 0x90: case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97: { reg.a = op_sub<Z80Mode>( src_value( op ) ); break; }
+            case 0x98: case 0x99: case 0x9a: case 0x9b: case 0x9c: case 0x9d: case 0x9e: case 0x9f: { op_sbb<Z80Mode>( src_value( op ) ); break; }
+            case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4: case 0xa5: case 0xa6: case 0xa7: { op_ana<Z80Mode>( src_value( op ) ); break; }
+            case 0xa8: case 0xa9: case 0xaa: case 0xab: case 0xac: case 0xad: case 0xae: case 0xaf: { op_xra<Z80Mode>( src_value( op ) ); break; }
+            case 0xb0: case 0xb1: case 0xb2: case 0xb3: case 0xb4: case 0xb5: case 0xb6: case 0xb7: { op_ora<Z80Mode>( src_value( op ) ); break; }
+            case 0xb8: case 0xb9: case 0xba: case 0xbb: case 0xbc: case 0xbd: case 0xbe: case 0xbf: { op_cmp<Z80Mode>( src_value( op ) ); break; }
+            case 0xc0: case 0xd0: case 0xe0: case 0xf0: case 0xc8: case 0xd8: case 0xe8: case 0xf8: // conditional return
+            {
+                if ( check_conditional( op ) )
+                {
+                    pc = popword( sp );
+                    reg.z80_set_memptr( pc );
+                }
+                else
+                    cycles -= cyclesnt;
+                break;
+            }
+            case 0xc1: case 0xd1: case 0xe1: { * reg.rpAddressFromOp( op ) = popword( sp ); break; } // pop rp
+            case 0xc2: case 0xd2: case 0xe2: case 0xf2: case 0xca: case 0xda: case 0xea: case 0xfa: // conditional jmp
+            {
+                uint16_t address = pcword( pc ); // must be consumed regardless of whether jump is taken
+                reg.z80_set_memptr( address ); // set regardless of whether the jump is taken
+                if ( check_conditional( op ) )
+                    pc = address;
+                // JP cc costs 10T whether or not the jump is taken -- no subtraction here
+                break;
+            }
+            case 0xc3: { uint16_t address = pcword( pc ); reg.z80_set_memptr( address ); pc = address; break; } // jmp a16
+            case 0xc4: case 0xd4: case 0xe4: case 0xf4: case 0xcc: case 0xdc: case 0xec: case 0xfc: // conditional call
+            {
+                uint16_t address = pcword( pc ); // must be consumed regardless of whether call is taken
+                reg.z80_set_memptr( address ); // set regardless of whether the call is taken
+                if ( check_conditional( op ) )
+                {
+                    pushword( sp, pc );
+                    pc = address;
+                }
+                else
+                    cycles -= ( Z80Mode ? 7 : cyclesnt ); // not-taken CALL cc is 10T on Z80 (17-7), 11T on 8080 (17-6)
+                break;
+            }
+            case 0xc5: case 0xd5: case 0xe5: { pushword( sp, * reg.rpAddressFromOp( op ) ); break; } // push rp
+            case 0xc6: { op_add<Z80Mode>( pcbyte( pc ) ); break; } // adi
+            case 0xc7: case 0xd7: case 0xe7: case 0xf7: case 0xcf: case 0xdf: case 0xef: case 0xff: // rst
+            {
+                // bits 5..3 are exp, which form an address 0000000000exp000 that is called.
+                // rst is generally invoked by DDT and hardware interrupts, which supply the one instruction rst.
+
+                pushword( sp, pc );
+                pc = 0x38 & (uint16_t) op;
+                reg.z80_set_memptr( pc );
+                break;
+            }
+            case 0xc9: { _op_ret: pc = popword( sp ); reg.z80_set_memptr( pc ); break; } // ret
+            case 0xcd: { uint16_t t = pcword( pc ); reg.z80_set_memptr( t ); pushword( sp, pc ); pc = t; break; } // call a16
+            case 0xce: { op_adc<Z80Mode>( pcbyte( pc ) ); break; } // aci
+            case 0xd3: { uint8_t port = pcbyte( pc ); x80_invoke_out( port ); reg.z80_set_memptr( ( (uint16_t) reg.a << 8 ) | ( ( port + 1 ) & 0xff ) ); break; } // out d8
+            case 0xd6: { reg.a = op_sub<Z80Mode>( pcbyte( pc ) ); break; } // sui
+            case 0xdb: { uint8_t port = pcbyte( pc ); reg.z80_set_memptr( ( (uint16_t) reg.a << 8 ) + port + 1 ); x80_invoke_in( port ); break; } // in d8
+            case 0xde: { op_sbb<Z80Mode>( pcbyte( pc ) ); break; } // sbi
+            case 0xe3: { uint16_t t = reg.H(); reg.SetH( mword( sp ) ); setmword( sp, t ); reg.z80_set_memptr( reg.H() ); break; } // xthl
+            case 0xe6: { op_ana<Z80Mode>( pcbyte( pc ) ); break; } // ani
+            case 0xe9: { pc = reg.H(); break; } // pchl
+            case 0xeb: { uint16_t t = reg.H(); reg.SetH( reg.D() ); reg.SetD( t ); break; } // xchg
+            case 0xee: { op_xra<Z80Mode>( pcbyte( pc ) ); break; } // xri
+            case 0xf1: { reg.SetPSW<Z80Mode>( popword( sp ) ); break; } // pop psw
+            case 0xf3: { reg.fINTE = false; break; } // di
+            case 0xf5: { pushword( sp, reg.PSW<Z80Mode>() ); break; } // push psw
+            case 0xf6: { op_ora<Z80Mode>( pcbyte( pc ) ); break; } // ori
+            case 0xf9: { sp = reg.H(); break; } // sphl
+            case 0xfb: { reg.fINTE = true; break; } // ei
+            case 0xfe: { op_cmp<Z80Mode>( pcbyte( pc ) ); break; } // cpi
+            default:
+            {
+                if ( Z80Mode )
+                {
+#if Z80_ZILOG_SCF_CCF
+                    g_z80PreviousStart = reg.z80PreviousStart; // for scf and ccf after a dd or fd prefix
+#endif
+                    cycles += z80_emulate( op, pc, sp ); // pc/sp passed by reference - no reg.pc/reg.sp sync needed
+                }
+                else if ( 0x08 == op ) // Pascal MT++ generates 8080 apps that use 0x08. Treat it as a NOP just like an 8080.
+                    break;
+                else
+                    x80_hard_exit( "Error: 8080 undocumented instruction: %#x, next byte %#x\n", op, memory[ pc + 1 ] );
+            } //default
+        } //switch
+
+        reg.z80_bump_r(); // do this for 8080 too to avoid the 'if' statement; see TRACK_Z80_R_REGISTER
+    } //while
+_all_done:
+    reg.pc = pc; // every exit from this loop (normal maxcycles exit, hlt, hook end-of-emulation)
+    reg.sp = sp; // funnels through here - flush the locals back so callers see current state
+#if Z80_ZILOG_SCF_CCF
+    reg.z80LastStart = currentStart;
+#endif
+    if ( ( g_State & stateProfile ) && ( cycles >= g_profileLastCycles ) )
+        g_pcHits[ g_profileLastPC ] += ( cycles - g_profileLastCycles );
+#if RETURN_INSTRUCTION_COUNT
+    return instructions;
+#else
+    return cycles;
+#endif
+} //x80_emulate_impl
+
+uint32_t x80_emulate( uint16_t maxcycles )
+{
+    if ( reg.fZ80Mode )
+        return x80_emulate_impl<true>( maxcycles );
+    return x80_emulate_impl<false>( maxcycles );
+} //x80_emulate

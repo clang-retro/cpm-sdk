@@ -1,9 +1,15 @@
 # cpm-sdk
 
-An SDK for CP/M-86 programs (CP/M-86 1.1 for the IBM PC and others,
-CP/M-86 Plus, Concurrent CP/M) built with clang from
-[clang-retro/llvm](https://github.com/clang-retro/llvm)
-(`--target=i8086-unknown-cpm`). It has:
+An SDK for CP/M programs built with clang from
+[clang-retro/llvm](https://github.com/clang-retro/llvm):
+
+- CP/M-86 (CP/M-86 1.1 for the IBM PC and others, CP/M-86 Plus,
+  Concurrent CP/M), with `--target=i8086-unknown-cpm`;
+- CP/M-80 (CP/M 2.2, CP/M 3 and compatibles) on the Z80, with
+  `--target=z80-unknown-cpm`, and on the 8080 and 8085, with
+  `--target=i8080-unknown-cpm`. See [CP/M-80](#cpm-80).
+
+For CP/M-86 it has:
 
 - the C library: [picolibc](https://github.com/clang-retro/picolibc) with
   a CP/M-86 layer (startup code, the command line, `malloc`, files through
@@ -14,9 +20,6 @@ CP/M-86 Plus, Concurrent CP/M) built with clang from
   and macOS;
 - scripts to run programs on Digital Research's CP/M-86 1.1 in QEMU;
 - examples.
-
-CP/M-80 (8080 and Z80) is not supported: clang has no backend for those
-CPUs yet.
 
 ## Using it
 
@@ -102,10 +105,51 @@ distribute it, and a formatted boot floppy from
 builds the tests in [`tests/`](tests) in both models and checks their
 output in cpm86run, and with `QEMU=1` on CP/M-86 1.1 too.
 
+## CP/M-80
+
+    clang --target=z80-unknown-cpm -Os hello.c -o hello.com
+    clang --target=i8080-unknown-cpm -Os hello.c -o hello.com
+
+The sysroots are `z80-cpm/` and `i8080-cpm/` next to clang's `bin/` (or
+`--sysroot=DIR`). [`build-sysroot-80.sh`](build-sysroot-80.sh) builds both
+from the same checkouts. The C library is the same as for CP/M-86, with
+picolibc's CP/M-80 startup code and BDOS call (`libos/cpm80`), so
+everything under [C programs](#c-programs) holds, with these differences:
+
+- clang compiles to ELF objects, links them with `ld.lld` at `0100h`
+  (`cpm80.ld` in the sysroot: the code, the read-only data and the data,
+  then the BSS) and writes the `.COM` file with `llvm-objcopy`. There are
+  no memory models.
+- The stack starts at the top of the TPA (the BDOS address at `0006h`);
+  the heap is everything from the end of the BSS to 2 KiB below it.
+- `exit(status)` sets the program return code on CP/M 3 (BDOS 108).
+  `time` reads the clock on CP/M 3 and MP/M (BDOS 105); CP/M 2.2 has none.
+- `<cpm.h>`'s `bdos(fn, de)` calls `0005h` with the function in C and the
+  parameter in DE, and returns BA (HL).
+- `int` is 16 bits, `long` 32 and `long long` 64; `float` and `double` are
+  IEEE single and double, in software. The Z80 code uses IX as the frame
+  pointer; the 8080 code runs on the Z80 too.
+- Programs are big: a `printf("%d")` hello is about 17 KiB on the Z80, as
+  the compiler calls the integer printf when the format allows. Printing
+  `double`s with the full printf and `strtod` takes about 57 KiB on the
+  Z80, and does not fit in 64 KiB on the 8080 yet.
+
+[`tools/ntvcm`](tools/ntvcm) is David Lee's CP/M 2.2 emulator, with the
+Z80 and (`-8`) the 8080:
+
+    make -C tools/ntvcm
+    tools/ntvcm/ntvcm hello.com
+    tools/ntvcm/ntvcm -8 hello.com
+
+and the tests run in it on both processors:
+
+    BIN=.../bin SYSROOTS=... tests/run-tests-80.sh
+
 ## License
 
 The SDK is under the GNU Affero General Public License v3 or later
 ([LICENSE](LICENSE)). The C library's CP/M-86 layer is in picolibc, under
 its BSD license. The 8086 emulator in `tools/cpm86run` is from
-[ntvdm](https://github.com/davidly/ntvdm), under CC0, and
+[ntvdm](https://github.com/davidly/ntvdm), under CC0, `tools/ntvcm` is
+[ntvcm](https://github.com/davidly/ntvcm), under CC0, and
 `tools/qemu/chainboot.S` is CC0.

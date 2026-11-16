@@ -1,8 +1,10 @@
-# For every pull request and push: build cpm86run, check the scripts, and
-# when clang-retro/llvm's llvm-prebuilt release has the i8086-unknown-cpm
-# target and llvm-exe2cmd, build the sysroot (picolibc from
-# clang-retro/picolibc's main branch, compiler-rt's builtins) and run the
-# tests in cpm86run in both memory models.
+# For every pull request and push: build cpm86run and ntvcm, check the
+# scripts, and when clang-retro/llvm's llvm-prebuilt release has the
+# i8086-unknown-cpm target and llvm-exe2cmd, build the sysroot (picolibc
+# from clang-retro/picolibc's main branch, compiler-rt's builtins) and run
+# the tests in cpm86run in both memory models. When it has the
+# z80-unknown-cpm target, the same for CP/M-80 in ntvcm, on the Z80 and the
+# 8080.
 name: Check
 
 on:
@@ -30,10 +32,14 @@ jobs:
       - name: Scripts
         run: |
           sh -n build-sysroot.sh
+          sh -n build-sysroot-80.sh
           sh -n tests/run-tests.sh
+          sh -n tests/run-tests-80.sh
           python3 -m py_compile tools/qemu/cpm86-qemu.py
       - name: Build cpm86run
         run: make -C tools/cpm86run
+      - name: Build ntvcm
+        run: make -C tools/ntvcm
       - name: Get clang
         env:
           GH_TOKEN: ${{ github.token }}
@@ -55,8 +61,13 @@ jobs:
           else
             echo "::warning::$asset has no i8086-unknown-cpm target or llvm-exe2cmd yet; skipping the tests"
           fi
+          if "$bin/clang" --target=z80-unknown-cpm -E -dM -x c /dev/null 2>/dev/null | grep -q __CPM80__; then
+            echo "HAVE_CPM80=1" >> "$GITHUB_ENV"
+          else
+            echo "::warning::$asset has no z80-unknown-cpm target yet; skipping the CP/M-80 tests"
+          fi
       - name: Get compiler-rt's builtins
-        if: env.HAVE_CPM == '1'
+        if: env.HAVE_CPM == '1' || env.HAVE_CPM80 == '1'
         uses: actions/checkout@v4
         with:
           repository: clang-retro/llvm
@@ -65,7 +76,7 @@ jobs:
           sparse-checkout: compiler-rt/lib/builtins
           persist-credentials: false
       - name: Get picolibc
-        if: env.HAVE_CPM == '1'
+        if: env.HAVE_CPM == '1' || env.HAVE_CPM80 == '1'
         uses: actions/checkout@v4
         with:
           repository: clang-retro/picolibc
@@ -97,4 +108,21 @@ jobs:
           for f in examples/*.c; do
             "$BIN/clang" --target=i8086-unknown-cpm --sysroot="$RUNNER_TEMP/i8086-cpm" \
               -Os -Wall -Werror "$f" -o "$RUNNER_TEMP/$(basename "$f" .c).cmd"
+          done
+      - name: Build the CP/M-80 sysroots
+        if: env.HAVE_CPM80 == '1'
+        run: |
+          pip install meson ninja
+          LLVM_SRC=$PWD/llvm PICOLIBC_SRC=$PWD/picolibc ./build-sysroot-80.sh "$RUNNER_TEMP/cpm80"
+      - name: CP/M-80 tests
+        if: env.HAVE_CPM80 == '1'
+        run: SYSROOTS=$RUNNER_TEMP/cpm80 tests/run-tests-80.sh
+      - name: CP/M-80 examples
+        if: env.HAVE_CPM80 == '1'
+        run: |
+          for cpu in z80 i8080; do
+            for f in examples/*.c; do
+              "$BIN/clang" --target=$cpu-unknown-cpm --sysroot="$RUNNER_TEMP/cpm80/$cpu-cpm" \
+                -Os -Wall -Werror "$f" -o "$RUNNER_TEMP/$(basename "$f" .c)-$cpu.com"
+            done
           done
