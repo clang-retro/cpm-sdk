@@ -73,7 +73,11 @@ jobs:
           repository: clang-retro/llvm
           ref: ${{ env.LLVM_SHA }}
           path: llvm
-          sparse-checkout: compiler-rt/lib/builtins
+          # The builtins' CMake files include compiler-rt/cmake and cmake.
+          sparse-checkout: |
+            compiler-rt/lib/builtins
+            compiler-rt/cmake
+            cmake
           persist-credentials: false
       - name: Get picolibc
         if: env.HAVE_CPM == '1' || env.HAVE_CPM80 == '1'
