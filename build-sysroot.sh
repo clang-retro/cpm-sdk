@@ -61,4 +61,8 @@ for m in ${MODELS:-tiny small}; do
   cp "$WORK/builtins-$m/lib/cpm/libclang_rt.builtins-i8086.a" \
      "$out/lib/$m/libclang_rt.builtins.a"
 done
+# The libraries' licences: a program built with them carries their code.
+mkdir -p "$out/share/licenses"
+cp "$PICOLIBC_SRC/COPYING.picolibc" "$out/share/licenses/"
+cp "$LLVM_SRC/compiler-rt/LICENSE.TXT" "$out/share/licenses/compiler-rt-LICENSE.TXT"
 echo "sysroot written to $out"

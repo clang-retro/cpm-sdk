@@ -147,9 +147,31 @@ and the tests run in it on both processors:
 
 ## License
 
-The SDK is under the GNU Affero General Public License v3 or later
-([LICENSE](LICENSE)). The C library's CP/M-86 layer is in picolibc, under
-its BSD license. The 8086 emulator in `tools/cpm86run` is from
-[ntvdm](https://github.com/davidly/ntvdm), under CC0, `tools/ntvcm` is
-[ntvcm](https://github.com/davidly/ntvcm), under CC0, and
-`tools/qemu/chainboot.S` is CC0.
+Copyright (C) clang-retro contributors.
+
+The SDK is free software under the GNU Affero General Public License,
+version 3 only (`AGPL-3.0-only`), like the other clang-retro SDKs; the full
+text is in [LICENSE](LICENSE). These parts keep their own licenses:
+
+- `tools/cpm86run` comes from [ntvdm](https://github.com/davidly/ntvdm) and
+  `tools/ntvcm` from [ntvcm](https://github.com/davidly/ntvcm), both by
+  David Lee under CC0. `tools/qemu/chainboot.S` is CC0 too.
+- The C library's CP/M layers are in picolibc, under its BSD license.
+
+### Programs you build
+
+A program built with the SDK contains only the sysroot's libraries, none of
+the SDK's own code:
+
+- picolibc (`crt0`, `libc.a`): BSD-style licenses. If you ship a program in
+  binary form, include their notices in its documentation. The sysroot has
+  them in `share/licenses/COPYING.picolibc`.
+- the compiler-rt builtins: Apache-2.0 with the LLVM exception, which needs
+  no notice for compiled code (`share/licenses/compiler-rt-LICENSE.TXT`).
+
+So you may distribute your programs under any license you like, as long as
+you include picolibc's notices. The examples and tests here are under the
+AGPL, like the rest of the SDK; code you copy from them comes with it.
+
+CP/M itself is not part of the SDK. `tools/qemu/cpm86-qemu.py` downloads
+CP/M-86 1.1 when it runs, and ntvcm emulates the CP/M 2.2 BDOS itself.

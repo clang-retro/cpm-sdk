@@ -66,5 +66,11 @@ for cpu in ${CPUS:-z80 i8080}; do
     { grep -E 'error|FAILED' "$WORK/builtins-$cpu.log" | head -20; exit 1; }
   cp "$WORK/builtins-$cpu/lib/cpm/libclang_rt.builtins-$cpu.a" \
      "$root/lib/libclang_rt.builtins.a"
+
+  # The libraries' licences: a program built with them carries their code.
+  mkdir -p "$root/share/licenses"
+  cp "$PICOLIBC_SRC/COPYING.picolibc" "$root/share/licenses/"
+  cp "$LLVM_SRC/compiler-rt/LICENSE.TXT" \
+     "$root/share/licenses/compiler-rt-LICENSE.TXT"
 done
 echo "sysroots written to $out"
