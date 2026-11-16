@@ -1,0 +1,727 @@
+#pragma once
+
+#include <bitset>
+#include <string.h>
+using namespace std;
+
+extern uint8_t memory[ 0x10fff0 ];
+
+// tracking cycles slows execution by >6%
+#define I8086_TRACK_CYCLES
+
+// true for undocumented 8086 behavior. false to fail fast if undocumented instructions are executed.
+#define I8086_UNDOCUMENTED true
+
+// when this (mostly unused as far as I can tell) interrupt is executed, i8086_invoke_syscall will be called.
+// Zenith and HP AT BIOSes may use it, along with DECnet and 10NET.
+const uint8_t i8086_interrupt_syscall = 0x69;
+
+struct i8086
+{
+    // al/bl/cl/dl are the low bytes of ax/bx/cx/dx; ah/bh/ch/dh are the high bytes.
+    // these are host-native register values (never guest memory), so only the byte
+    // offset used to alias each half differs by host endianness -- no runtime swap.
+
+#ifdef TARGET_BIG_ENDIAN
+    uint8_t al() { return * ( 1 + (uint8_t *) & ax ); }
+    uint8_t ah() { return * (uint8_t *) & ax; }
+    uint8_t bl() { return * ( 1 + (uint8_t *) & bx ); }
+    uint8_t bh() { return * (uint8_t *) & bx; }
+    uint8_t cl() { return * ( 1 + (uint8_t *) & cx ); }
+    uint8_t ch() { return * (uint8_t *) & cx; }
+    uint8_t dl() { return * ( 1 + (uint8_t *) & dx ); }
+    uint8_t dh() { return * (uint8_t *) & dx; }
+
+    void set_al( uint8_t val ) { * ( 1 + (uint8_t *) & ax ) = val; }
+    void set_bl( uint8_t val ) { * ( 1 + (uint8_t *) & bx ) = val; }
+    void set_cl( uint8_t val ) { * ( 1 + (uint8_t *) & cx ) = val; }
+    void set_dl( uint8_t val ) { * ( 1 + (uint8_t *) & dx ) = val; }
+    void set_ah( uint8_t val ) { * (uint8_t *) & ax = val; }
+    void set_bh( uint8_t val ) { * (uint8_t *) & bx = val; }
+    void set_ch( uint8_t val ) { * (uint8_t *) & cx = val; }
+    void set_dh( uint8_t val ) { * (uint8_t *) & dx = val; }
+#else
+    uint8_t al() { return * (uint8_t *) & ax; }
+    uint8_t ah() { return * ( 1 + (uint8_t *) & ax ); }
+    uint8_t bl() { return * (uint8_t *) & bx; }
+    uint8_t bh() { return * ( 1 + (uint8_t *) & bx ); }
+    uint8_t cl() { return * (uint8_t *) & cx; }
+    uint8_t ch() { return * ( 1 + (uint8_t *) & cx ); }
+    uint8_t dl() { return * (uint8_t *) & dx; }
+    uint8_t dh() { return * ( 1 + (uint8_t *) & dx ); }
+
+    void set_al( uint8_t val ) { * (uint8_t *) & ax = val; }
+    void set_bl( uint8_t val ) { * (uint8_t *) & bx = val; }
+    void set_cl( uint8_t val ) { * (uint8_t *) & cx = val; }
+    void set_dl( uint8_t val ) { * (uint8_t *) & dx = val; }
+    void set_ah( uint8_t val ) { * ( 1 + (uint8_t *) & ax ) = val; }
+    void set_bh( uint8_t val ) { * ( 1 + (uint8_t *) & bx ) = val; }
+    void set_ch( uint8_t val ) { * ( 1 + (uint8_t *) & cx ) = val; }
+    void set_dh( uint8_t val ) { * ( 1 + (uint8_t *) & dx ) = val; }
+#endif
+
+    uint16_t get_ax() { return ax; }
+    uint16_t get_bx() { return bx; }
+    uint16_t get_cx() { return cx; }
+    uint16_t get_dx() { return dx; }
+    uint16_t get_si() { return si; }
+    uint16_t get_di() { return di; }
+    uint16_t get_bp() { return bp; }
+    uint16_t get_sp() { return sp; }
+    uint16_t get_ip() { return ip; }
+    uint16_t get_es() { return es; }
+    uint16_t get_cs() { return cs; }
+    uint16_t get_ss() { return ss; }
+    uint16_t get_ds() { return ds; }
+    uint16_t get_flags() { materializeFlags(); return flags; }
+
+    void set_ax( uint16_t val ) { ax = val; }
+    void set_bx( uint16_t val ) { bx = val; }
+    void set_cx( uint16_t val ) { cx = val; }
+    void set_dx( uint16_t val ) { dx = val; }
+    void set_si( uint16_t val ) { si = val; }
+    void set_di( uint16_t val ) { di = val; }
+    void set_bp( uint16_t val ) { bp = val; }
+    void set_sp( uint16_t val ) { sp = val; }
+    void set_ip( uint16_t val ) { ip = val; }
+    void set_es( uint16_t val ) { es = val; }
+    void set_cs( uint16_t val ) { cs = val; }
+    void set_ss( uint16_t val ) { ss = val; }
+    void set_ds( uint16_t val ) { ds = val; }
+    void set_flags( uint16_t val ) { flags = val; unmaterializeFlags(); }
+
+    void set_carry( bool f ) { fCarry = f; }
+    void set_zero( bool f ) { fZero = f; }
+    void set_trap( bool f ) { fTrap = f; }
+    void set_interrupt( bool f ) { fInterrupt = f; }
+
+    bool get_carry() { return fCarry; }
+    bool get_zero() { return fZero; }
+    bool get_trap() { return fTrap; }
+    bool get_interrupt() { return fInterrupt; }
+    bool get_overflow() { return fOverflow; }
+
+    // emulator API
+
+    uint64_t emulate( uint64_t maxcycles );             // execute up to about maxcycles
+    void exit_emulate_early( void );                    // tell the emulator not to wait for maxcycles to return
+    bool external_interrupt( uint8_t interrupt_num );   // invoke this simulated hardware/external interrupt immediately
+    void trace_instructions( bool trace );              // enable/disable tracing each instruction
+    void trace_state( void );                           // trace the registers
+    void end_emulation( void );                         // make the emulator return at the start of the next instruction
+    void enable_interrupt_syscall( bool enable ) { fSyscallEnabled = enable; } // enable int 0x69 to trigger a syscall
+
+#ifndef NDEBUG
+    uint8_t trace_opcode_usage( void );                    // trace trends in opcode usage
+#endif
+
+    void reset()
+    {
+        ax = bx = cx = dx = si = di = bp = sp = ip = es = cs = ss = ds = flags = 0;
+        prefix_segment_override = prefix_repeat_opcode = 0xff;
+        _pcode = 0;
+        _bc = _b0 = _b1 = _mod = _reg = _rm = 0;
+        _effective_offset = 0;
+        fCarry = fParityEven = fAuxCarry = fZero = fSign = fTrap = fInterrupt = fDirection = fOverflow = fIgnoreTrap = false;
+        cycles = 0;
+        fSyscallEnabled = false;
+        reset_disassembler();
+    } //reset
+
+    void reset_disassembler();
+
+    i8086()
+    {
+        reset();
+        reset_disassembler();
+
+#ifdef TARGET_BIG_ENDIAN
+        reg8_pointers[ 0 ] = 1 + (uint8_t *) & ax; // al
+        reg8_pointers[ 1 ] = 1 + (uint8_t *) & cx; // cl
+        reg8_pointers[ 2 ] = 1 + (uint8_t *) & dx; // dl
+        reg8_pointers[ 3 ] = 1 + (uint8_t *) & bx; // bl
+        reg8_pointers[ 4 ] = (uint8_t *) & ax;  // ah
+        reg8_pointers[ 5 ] = (uint8_t *) & cx;  // ch
+        reg8_pointers[ 6 ] = (uint8_t *) & dx;  // dh
+        reg8_pointers[ 7 ] = (uint8_t *) & bx;  // bh
+#else
+        reg8_pointers[ 0 ] = (uint8_t *) & ax;  // al
+        reg8_pointers[ 1 ] = (uint8_t *) & cx;  // cl
+        reg8_pointers[ 2 ] = (uint8_t *) & dx;  // dl
+        reg8_pointers[ 3 ] = (uint8_t *) & bx;  // bl
+        reg8_pointers[ 4 ] = 1 + (uint8_t *) & ax; // ah
+        reg8_pointers[ 5 ] = 1 + (uint8_t *) & cx; // ch
+        reg8_pointers[ 6 ] = 1 + (uint8_t *) & dx; // dh
+        reg8_pointers[ 7 ] = 1 + (uint8_t *) & bx; // bh
+#endif
+
+        reg16_pointers[ 0 ] = & ax;
+        reg16_pointers[ 1 ] = & cx;
+        reg16_pointers[ 2 ] = & dx;
+        reg16_pointers[ 3 ] = & bx;
+        reg16_pointers[ 4 ] = & sp;
+        reg16_pointers[ 5 ] = & bp;
+        reg16_pointers[ 6 ] = & si;
+        reg16_pointers[ 7 ] = & di;
+    } //i8086
+
+    void push( uint16_t val )
+    {
+        sp--;
+        setmbyte( ss, sp, val >> 8 );          // one byte at a time for segment wrapping
+        sp--;
+        setmbyte( ss, sp, val & 0xff );
+    } //push
+
+    uint16_t pop()
+    {
+        uint8_t l = mbyte( ss, sp );
+        sp++;
+        uint8_t h = mbyte( ss, sp );
+        sp++;;
+        return ( (uint16_t) h << 8 ) | (uint16_t) l;
+    } //pop
+
+    void * flat_address( uint16_t seg, uint16_t offset ) { return memory + flatten( seg, offset ); }
+    uint8_t * flat_address8( uint16_t seg, uint16_t offset ) { return (uint8_t *) flat_address( seg, offset ); }
+    uint16_t * flat_address16( uint16_t seg, uint16_t offset ) { return (uint16_t *) flat_address( seg, offset ); }
+
+    // Guest words need not be aligned. Fixed-size copies let the compiler use word
+    // accesses where supported and byte accesses on strict-alignment targets.
+    // Use the builtin explicitly because our GCC/Clang builds use -fno-builtin.
+    static uint16_t read_unaligned_word( const void * p )
+    {
+        uint16_t value;
+#if defined( __GNUC__ ) || defined( __clang__ )
+        __builtin_memcpy( &value, p, sizeof( value ) );
+#else
+        memcpy( &value, p, sizeof( value ) );
+#endif
+        return value;
+    } //read_unaligned_word
+
+    static void write_unaligned_word( void * p, uint16_t value )
+    {
+#if defined( __GNUC__ ) || defined( __clang__ )
+        __builtin_memcpy( p, &value, sizeof( value ) );
+#else
+        memcpy( p, &value, sizeof( value ) );
+#endif
+    } //write_unaligned_word
+
+    // read a little-endian 16-bit value at an address that is known to be guest code bytes
+    // (never a host register) -- always byte-swap on a big-endian host.
+    static uint16_t read_iword( const void * p )
+    {
+#ifdef TARGET_BIG_ENDIAN
+        return flip_endian16( read_unaligned_word( p ) );
+#else
+        return read_unaligned_word( p );
+#endif
+    } //read_iword
+
+    uint8_t mbyte( uint16_t seg, uint16_t offset ) { return * flat_address8( seg, offset ); }
+    void setmbyte( uint16_t seg, uint16_t offset, uint8_t value ) { * flat_address8( seg, offset ) = value; }
+
+    // word-at-a-time access to guest memory, one byte at a time so a word at offset 0xffff
+    // wraps to offset 0 of the same segment instead of spilling into the next paragraph.
+    uint16_t mword( uint16_t seg, uint16_t offset )
+    {
+        uint16_t lo = mbyte( seg, offset );
+        uint16_t hi = mbyte( seg, (uint16_t) ( offset + 1 ) );
+        return ( hi << 8 ) | lo;
+    } //mword
+
+    void setmword( uint16_t seg, uint16_t offset, uint16_t value )
+    {
+        setmbyte( seg, offset, (uint8_t) value );
+        setmbyte( seg, (uint16_t) ( offset + 1 ), (uint8_t) ( value >> 8 ) );
+    } //setmword
+
+  private:
+    // the code assumes relative positions of most of these member variables. they can't easily be moved around.
+
+    uint16_t ax, bx, cx, dx;
+    uint16_t si, di, bp, sp, ip;
+    uint16_t es, cs, ss, ds;
+    uint16_t flags;
+    uint8_t prefix_segment_override; // 0xff for none, 0..3 for es, cs, ss, ds
+    uint8_t prefix_repeat_opcode;    // 0xff for none, f2 repne/repnz, f3 rep/repe/repz
+
+    // bits   0,           2,         4,     6,     7,     8,          9,         10,        11
+    bool fCarry, fParityEven, fAuxCarry, fZero, fSign, fTrap, fInterrupt, fDirection, fOverflow;
+    bool fIgnoreTrap;
+    bool fSyscallEnabled;
+
+    // state used for instruction decoding. these start with underscore to differentiate them
+
+    uint8_t _bc;      // # of bytes consumed by the currently running instruction
+    uint8_t _b0;      // pcode[ 0 ] -- the first opcode of the currently running instruction
+    uint8_t _b1;      // pcode[ 1 ]
+    uint8_t _rm;      // bits 2:0 of _b1. register or memory
+    uint8_t _reg;     // bits 5:3 of _b1. register (generally, but also math in some cases)
+    uint8_t _mod;     // bits 7:6 of _b1
+    uint8_t * _pcode; // pointer to the first opcode currently executing
+    uint16_t _effective_offset; // for word instructions that have an address offset. used to handle segment wrapping
+    uint8_t _wrap_scratch[ 6 ]; // holds a segment-wrapped copy of the instruction bytes; see decode_instruction()
+
+    uint8_t * reg8_pointers[ 8 ];
+    uint16_t * reg16_pointers[ 8 ];
+    uint64_t cycles;  // # of cycles executed so far during a call to emulate()
+
+    void decode_instruction( uint8_t * pcode )
+    {
+        _bc = 1;
+
+        // An instruction (opcode + modrm + disp16 + imm16) can be up to 6 bytes. pcode
+        // is a flat pointer into memory computed from cs:ip, so reading past it with
+        // plain pointer arithmetic (as _pcode[n]/read_iword(_pcode+n)/b12()/b34() do
+        // throughout the decoder) pulls in the next linear byte rather than wrapping
+        // back to offset 0 of the same segment the way real 8086 segment-relative
+        // offsets do -- the same wraparound read_word()/write_word() already handle
+        // for data operands via _effective_offset. If ip is close enough to the top of
+        // the segment that those 6 bytes could cross 0xffff, fetch through a small
+        // wrap-aware scratch buffer instead so every existing _pcode-relative read
+        // still works unchanged.
+        if ( ip > 0xfffa )
+        {
+            for ( uint16_t i = 0; i < _countof( _wrap_scratch ); i++ )
+                _wrap_scratch[ i ] = mbyte( cs, ip + i ); // ip+i wraps via uint16_t arithmetic
+            pcode = _wrap_scratch;
+        }
+
+        _pcode = pcode;
+        _b0 = pcode[ 0 ];
+        _b1 = pcode[ 1 ];
+        _rm = ( _b1 & 7 );
+        _reg = ( ( _b1 >> 3 ) & 7 );
+        _mod = ( _b1 >> 6 );
+        _effective_offset = 0;
+    } //decode_instruction
+
+    bool isword() { return ( _b0 & 1 ); } // true if the instruction is dealing with a word, not a byte (there are several exceptions)
+    bool toreg() { return ( _b0 & 2 ); } // decode on the fly since it's rarely used. instruction is writing to a register, not memory
+    uint16_t b12() { return read_iword( _pcode + 1 ); } // bytes 1 and 2 from the start of the opcode
+    uint16_t b34() { return read_iword( _pcode + 3 ); } // bytes 3 and 4 from the start of the opcode
+
+    void trace_decode()
+    {
+        tracer.Trace( "  decoded as _mod %02x, reg %02x, _rm %02x, isword %d, toreg %d, segment override %d\n",
+                      _mod, _reg, _rm, isword(), toreg(), prefix_segment_override );
+    } //trace_decode
+
+    void materializeFlags()
+    {
+        flags = 0xf002; // these bits are meaningless, but always turned on on real hardware
+        if ( fCarry ) flags |= ( 1 << 0 );
+        if ( fParityEven ) flags |= ( 1 << 2 );
+        if ( fAuxCarry ) flags |=  ( 1 << 4 );
+        if ( fZero ) flags |= ( 1 << 6 );
+        if ( fSign ) flags |= ( 1 << 7 );
+        if ( fTrap ) flags |= ( 1 << 8 );
+        if ( fInterrupt ) flags |= ( 1 << 9 );
+        if ( fDirection ) flags |= ( 1 << 10 );
+        if ( fOverflow ) flags |= ( 1 << 11 );
+    } //materializeFlags
+
+    void unmaterializeFlags()
+    {
+        fCarry = ( 0 != ( flags & ( 1 << 0 ) ) );
+        fParityEven = ( 0 != ( flags & ( 1 << 2 ) ) );
+        fAuxCarry = ( 0 != ( flags & ( 1 << 4 ) ) );
+        fZero = ( 0 != ( flags & ( 1 << 6 ) ) );
+        fSign = ( 0 != ( flags & ( 1 << 7 ) ) );
+        fTrap = ( 0 != ( flags & ( 1 << 8 ) ) );
+        fInterrupt = ( 0 != ( flags & ( 1 << 9 ) ) );
+        fDirection = ( 0 != ( flags & ( 1 << 10 ) ) );
+        fOverflow = ( 0 != ( flags & ( 1 << 11 ) ) );
+    } //unmaterializeFlags
+
+    void set_PSZ16( uint16_t val )
+    {
+        fParityEven = is_parity_even8( (uint8_t) val ); // only the lower 8 bits are used to determine parity on the 8086
+        fZero = ( 0 == val );
+        fSign = ( 0 != ( 0x8000 & val ) );
+    } //set_PSZ16
+
+    void set_PSZ8( uint8_t val )
+    {
+        fParityEven = is_parity_even8( val );
+        fZero = ( 0 == val );
+        fSign = ( 0 != ( 0x80 & val ) );
+    } //set_PSZ8
+
+    void reset_carry_overflow() { fCarry = false; fOverflow = false; }
+
+    uint16_t * seg_reg( uint8_t val ) { assert( val <= 3 ); return ( ( & es ) + val ); }
+    uint8_t * get_preg8( uint8_t reg ) { assert( reg <= 7 ); return reg8_pointers[ reg ]; }
+    uint16_t * get_preg16( uint8_t reg ) { assert( reg <= 7 ); return reg16_pointers[ reg ]; }
+
+    uint16_t get_seg_value()
+    {
+        if ( 0xff == prefix_segment_override )
+            return ds; // the default if there is no override
+
+        AddCycles( 2 );
+        return * seg_reg( prefix_segment_override );
+    } //get_seg_value
+
+    uint32_t flatten( uint16_t seg, uint16_t offset )
+    {
+        uint32_t flat = ( ( (uint32_t) seg ) << 4 ) + offset;
+
+        #ifndef NDEBUG
+            //if ( flat < 0x400 )
+            //    tracer.Trace( "  referencing low-memory %#x\n", flat );
+            //if ( flat >= 0x400 && flat < 0x600)
+            //    tracer.Trace( "  referencing bios data area %#x\n", flat );
+            //if ( flat < 0xa00 && flat >= 0x600)
+            //    tracer.Trace( "  referencing lowish-memory %#x\n", flat );
+            //if ( flat >= 0xb8000 && flat < 0xb8fa0 )
+            //    tracer.Trace( "  referencing cga-memory page 0 %#x row %d column %d\n", flat, (flat - 0xb8000) / 160, ( (flat - 0xb8000) % 160 ) / 2 );
+            //if ( flat >= 0xb8fa0 && flat < 0xbbe80 )
+            //    tracer.Trace( "  referencing cga-memory page 1 %#x\n", flat );
+            //if ( flat >= 0xbbe80 && flat < 0x100000 )
+            //    tracer.Trace( "  referencing high-memory %#x\n", flat );
+            //if ( flat >= 0x100000 )
+            //    tracer.Trace( "  referencing above 1mb %#x\n", flat );
+        #endif
+
+        // The 8086 can address 0000:0000 .. ffff:ffff, which is 0 .. 0x10ffef.
+        // But it only has 20 address lines, so high memory area (HMA) >= 0x100000 references wrap to conventional memory.
+        // The only apps I've found that depend on wrapping are those produced by IBM Pascal Version 2.00.
+        // Microsoft LISP v5.10 (mulisp.exe) references HMA and works whether the CPU wraps or not.
+        // Pass 3 (pas3.exe) of Microsoft FORTRAN77 V3.13 8/05/83 references HMA along with the apps it generates.
+        //    The compiler generates good code without wrapping, but the apps it creates require wrapping to work.
+        // Artek Ada Compiler Ver. 1.25's linklib.exe and interpreter ai.exe both reference HMA but work without wrapping.
+        // This extra mask costs about 1% in performance but is more compatible.
+
+        return ( 0xfffff & flat );
+    } //flatten
+
+    void unhandled_instruction();
+
+#ifdef TARGET_BIG_ENDIAN
+    // read_word/write_word are handed a uint16_t * that points either into the register
+    // file (a real host-native uint16_t -- no swap needed) or into guest memory (raw
+    // little-endian bytes -- needs a swap). distinguish by whether p falls inside the
+    // guest memory array.
+    static bool is_guest_memory( void * p )
+    {
+        return ( (uint8_t *) p >= memory ) && ( (uint8_t *) p < ( memory + sizeof( memory ) ) );
+    } //is_guest_memory
+#endif
+
+    uint16_t read_word( void * p )
+    {
+        if ( 0xffff == _effective_offset )
+        {
+            uint8_t *pb = (uint8_t *) p;
+            uint16_t lo = (uint16_t) * pb;
+            uint16_t hi = (uint16_t) * ( pb - 65535 );
+            return ( hi << 8 ) | lo;
+        }
+
+#ifdef TARGET_BIG_ENDIAN
+        if ( is_guest_memory( p ) )
+            return flip_endian16( read_unaligned_word( p ) );
+#endif
+        return read_unaligned_word( p );
+    } //read_word
+
+    void write_word( void * p, uint16_t val )
+    {
+        if ( 0xffff == _effective_offset )
+        {
+            uint8_t *pb = (uint8_t *) p;
+            *pb = (uint8_t) ( val & 0xff );
+            * ( pb - 65535 ) = (uint8_t) ( val >> 8 );
+            return;
+        }
+
+#ifdef TARGET_BIG_ENDIAN
+        if ( is_guest_memory( p ) )
+        {
+            write_unaligned_word( p, flip_endian16( val ) );
+            return;
+        }
+#endif
+        write_unaligned_word( p, val );
+    } //write_word
+
+    uint16_t * add_two_wrap( uint16_t * p )
+    {
+        // _effective_offset must always advance by 2 (with wraparound) to track the true
+        // offset of the word p now points at -- read_word/write_word rely on it being
+        // accurate to detect their own wrap case. Compute the offset-wrap condition from
+        // the old value first, since it reflects where p started, not where it ends up.
+        bool offset_wraps = ( 0xfffe == _effective_offset || 0xffff == _effective_offset );
+        _effective_offset += 2;
+
+        p = (uint16_t *) ( (uint8_t *) p + 2 );
+        uint8_t * beyond = memory + 1024 * 1024;
+
+        if ( (uint8_t *) p == beyond )
+        {
+            tracer.Trace( "wrapped back to start of memory in add_two_wrap\n" );
+            p = (uint16_t *) memory;
+        }
+        else if ( (uint8_t *) p == ( beyond + 1 ) )
+        {
+            tracer.Trace( "wrapped back to start of memory plus one in add_two_wrap\n" );
+            p = (uint16_t *) ( memory + 1 );
+        }
+        else if ( offset_wraps )
+        {
+            tracer.Trace( "_effective_offset in add_two_wrap wrapped to %04x, p start is %p\n", _effective_offset, p );
+            uint8_t * pb = (uint8_t *) p;
+            p = (uint16_t *) ( pb - 65536 );
+        }
+
+        return p;
+    } //add_two_wrap
+
+    uint16_t get_displacement()
+    {
+        assert( _rm <= 7 );
+        switch ( _rm )
+        {
+            case 0: AddCycles( 7 ); return bx + si;
+            case 1: AddCycles( 7 ); return bx + di;
+            case 2: AddCycles( 8 ); return bp + si;
+            case 3: AddCycles( 8 ); return bp + di;
+            case 4: AddCycles( 6 ); return si;
+            case 5: AddCycles( 6 ); return di;
+            case 6: AddCycles( 6 ); return bp;
+            case 7: AddCycles( 6 ); return bx;
+        }
+
+        assume_false;
+    } //get_displacement
+
+    uint16_t get_displacement_seg()
+    {
+        if ( 0xff == prefix_segment_override ) // if no segment override
+        {
+            if ( 2 == _rm || 3 == _rm || 6 == _rm ) // bp defaults to ss. see get_displacement(): 2/3/6 use bp
+                return ss;
+
+            return ds;
+        }
+
+        AddCycles( 2 );
+        return * seg_reg( prefix_segment_override );
+    } //get_displacement_seg
+
+    void * get_rm_ptr_common()
+    {
+        assert( _mod <= 2 );
+
+        if ( 1 == _mod ) // 1-byte signed immediate offset from register(s)
+        {
+            _bc += 1;
+            AddCycles( 4 );
+            int16_t offset = (int16_t) (int8_t) _pcode[ 2 ];
+            _effective_offset = get_displacement() + offset;
+            return flat_address( get_displacement_seg(), _effective_offset );
+        }
+
+        if ( 2 == _mod ) // 2-byte unsigned immediate offset from register(s)
+        {
+            _bc += 2;
+            AddCycles( 5 );
+            uint16_t offset = read_iword( _pcode + 2 );
+            _effective_offset = get_displacement() + offset;
+            return flat_address( get_displacement_seg(), _effective_offset );
+        }
+
+        if ( 6 == _rm )  // 0 == mod. least frequent. immediate pointer to offset
+        {
+            _bc += 2;
+            AddCycles( 5 );
+            _effective_offset = read_iword( _pcode + 2 );
+            return flat_address( get_seg_value(), _effective_offset );
+        }
+
+        _effective_offset = get_displacement();
+        return flat_address( get_displacement_seg(), _effective_offset ); // no offset; just a value from register(s)
+    } //get_rm_ptr_common
+
+    uint16_t * get_rm_ptr16()
+    {
+        // these instructions are even yet operate on words: mov r16/m16, sreg; mov sreg, reg16/mem16; les reg16, [mem16]
+        assert( isword() || ( 0x8c == _b0 ) || ( 0x8e == _b0 ) || ( 0xc4 == _b0 ) );
+
+        if ( 3 == _mod )
+            return get_preg16( _rm );
+
+        return (uint16_t *) get_rm_ptr_common();
+    } //get_rm_ptr16
+
+    uint8_t * get_rm_ptr8()
+    {
+        assert( !isword() );
+        if ( 3 == _mod )
+            return get_preg8( _rm );
+
+        return (uint8_t *) get_rm_ptr_common();
+    } //get_rm_ptr8
+
+    uint16_t get_rm_ea() // effective address. used strictly for lea
+    {
+        assert( isword() );
+        assert( 0x8d == _b0 ); // it's lea
+        assert( _mod <= 2 ); // lea specifies that the source operand must be memory, not a register
+
+        if ( 1 == _mod )
+        {
+            _bc += 1;
+            int16_t offset = (int16_t) (int8_t) _pcode[ 2 ]; // cast for sign extension
+            return get_displacement() + offset;
+        }
+
+        if ( 2 == _mod )
+        {
+            _bc += 2;
+            uint16_t offset = read_iword( _pcode + 2 );
+            return get_displacement() + offset;
+        }
+
+        if ( 6 == _rm )  // 0 == mod. least frequent
+        {
+            _bc += 2;
+            return read_iword( _pcode + 2 );
+        }
+
+        return get_displacement();
+    } //get_rm_ea
+
+    uint16_t * get_op_args16( uint16_t & rhs )
+    {
+        assert( isword() );
+        if ( toreg() )
+        {
+            rhs = read_word( get_rm_ptr16() ); // could be a register or guest memory
+            return get_preg16( _reg );
+        }
+
+        rhs = * get_preg16( _reg ); // always a register; never guest memory
+        return get_rm_ptr16();
+    } //get_op_args16
+
+    uint8_t * get_op_args8( uint8_t & rhs )
+    {
+        assert( !isword() );
+        if ( toreg() )
+        {
+            rhs = * get_rm_ptr8();
+            return get_preg8( _reg );
+        }
+
+        rhs = * get_preg8( _reg );
+        return get_rm_ptr8();
+    } //get_op_args8
+
+    const char * render_flags() // show the subset actually used with any frequency
+    {
+        static char acflags[13] = {0};
+        size_t next = 0;
+        acflags[ next++ ] = fOverflow ? 'O' : 'o';
+        acflags[ next++ ] = fDirection ? 'D' : 'd';
+        acflags[ next++ ] = fInterrupt ? 'I' : 'i';
+        acflags[ next++ ] = fTrap ? 'T' : 't';
+        acflags[ next++ ] = fSign ? 'S' : 's';
+        acflags[ next++ ] = fZero ? 'Z' : 'z';
+        acflags[ next++ ] = fAuxCarry ? 'A' : 'a';
+        acflags[ next++ ] = fParityEven ? 'P' : 'p';
+        acflags[ next++ ] = fCarry ? 'C' : 'c';
+        acflags[ next ] = 0;
+        return acflags;
+    } //render_flags
+
+    bool handle_state();
+    void do_math8( uint8_t math, uint8_t * psrc, uint8_t rhs );
+    void do_math16( uint8_t math, uint16_t * psrc, uint16_t rhs );
+    uint8_t op_sub8( uint8_t lhs, uint8_t rhs, bool borrow = false );
+    uint8_t op_add8( uint8_t lhs, uint8_t rhs, bool carry = false );
+    uint8_t op_and8( uint8_t lhs, uint8_t rhs );
+    uint8_t op_or8( uint8_t lhs, uint8_t rhs );
+    uint8_t op_xor8( uint8_t lhs, uint8_t rhs );
+    uint16_t op_sub16( uint16_t lhs, uint16_t rhs, bool borrow = false );
+    uint16_t op_add16( uint16_t lhs, uint16_t rhs, bool carry = false );
+    uint16_t op_and16( uint16_t lhs, uint16_t rhs );
+    uint16_t op_or16( uint16_t lhs, uint16_t rhs );
+    uint16_t op_xor16( uint16_t lhs, uint16_t rhs );
+    void op_rol8( uint8_t * pval, uint8_t shift );
+    void op_ror8( uint8_t * pval, uint8_t shift );
+    void op_rcl8( uint8_t * pval, uint8_t shift );
+    void op_rcr8( uint8_t * pval, uint8_t shift );
+    void op_sal8( uint8_t * pval, uint8_t shift );
+    void op_shr8( uint8_t * pval, uint8_t shift );
+    void op_sar8( uint8_t * pval, uint8_t shift );
+    void op_rol16( uint16_t * pval, uint8_t shift );
+    void op_ror16( uint16_t * pval, uint8_t shift );
+    void op_rcl16( uint16_t * pval, uint8_t shift );
+    void op_rcr16( uint16_t * pval, uint8_t shift );
+    void op_sal16( uint16_t * pval, uint8_t shift );
+    void op_shr16( uint16_t * pval, uint8_t shift );
+    void op_sar16( uint16_t * pval, uint8_t shift );
+    void op_cmps8();
+    void op_sto8();
+    void op_lods8();
+    void op_scas8();
+    void op_movs8();
+    void op_cmps16();
+    void op_sto16();
+    void op_lods16();
+    void op_scas16();
+    void op_movs16();
+    void update_index16( uint16_t & index_register );
+    void update_index8( uint16_t & index_register );
+    void update_rep_sidi8();
+    void update_rep_sidi16();
+    uint8_t op_inc8( uint8_t val );
+    uint8_t op_dec8( uint8_t val );
+    uint16_t op_inc16( uint16_t val );
+    uint16_t op_dec16( uint16_t val );
+    void op_interrupt( uint8_t interrupt_num, uint8_t instruction_length );
+    void op_rotate8( uint8_t * pval, uint8_t operation, uint8_t amount );
+    void op_rotate16( uint16_t * pval, uint8_t operation, uint8_t amount );
+    void op_daa();
+    void op_das();
+    void op_aas();
+    void op_aaa();
+    void op_sahf();
+    void op_lahf();
+    bool op_f6();
+    bool op_f7();
+    bool op_ff();
+
+    #if I8086_UNDOCUMENTED
+        void op_setmo8( uint8_t * pval, uint8_t amount );
+        void op_setmo16( uint16_t * pval, uint8_t amount );
+    #endif
+
+    #ifdef I8086_TRACK_CYCLES
+        void AddCycles( uint8_t amount ) { cycles += amount; }
+        void AddMemCycles( uint8_t amount ) { if ( 3 != _mod ) cycles += amount; }
+    #else
+        void AddCycles( uint8_t amount ) {}
+        void AddMemCycles( uint8_t amount ) {}
+    #endif
+    void RemoveOpcodeCycles(); // undoes the automatic per-opcode-fetch base cost for _b0; used when a rep prefix
+                                // means that cost was already covered by the prefix byte's own base cost instead
+
+}; //i8086
+
+extern i8086 cpu;
+
+// callbacks when instructions are executed
+
+extern void i8086_invoke_syscall( uint8_t interrupt );            // called when i8086_opcode_syscall is executed
+extern void i8086_invoke_halt();                                  // called when the HLT instruction is executed
+extern uint8_t i8086_invoke_in_byte( uint16_t port );             // called for the instructions: in of size byte
+extern uint16_t i8086_invoke_in_word( uint16_t port );            // called for the instructions: in of size word
+extern void i8086_invoke_out_byte( uint16_t port, uint8_t val );  // called for the instructions: out of size byte
+extern void i8086_invoke_out_word( uint16_t port, uint16_t val ); // called for the instructions: out of size word
+extern void i8086_hard_exit( const char * pcerror );              // called for fatal errors

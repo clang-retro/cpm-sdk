@@ -1,0 +1,13 @@
+# CP/M-86 itself (CPM.SYS, boot floppies) is not part of this SDK; the QEMU
+# script downloads it.
+*.img
+*.sys
+*.SYS
+/build-cpm/
+/tests-out/
+/tools/cpm86run/cpm86run
+/tools/cpm86run/cpm86run.exe
+*.log
+__pycache__/
+*.cmd
+*.CMD

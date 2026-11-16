@@ -1,0 +1,100 @@
+# For every pull request and push: build cpm86run, check the scripts, and
+# when clang-retro/llvm's llvm-prebuilt release has the i8086-unknown-cpm
+# target and llvm-exe2cmd, build the sysroot (picolibc from
+# clang-retro/picolibc's main branch, compiler-rt's builtins) and run the
+# tests in cpm86run in both memory models.
+name: Check
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'LICENSE*']
+  pull_request:
+    paths-ignore: ['**/*.md', 'LICENSE*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Scripts
+        run: |
+          sh -n build-sysroot.sh
+          sh -n tests/run-tests.sh
+          python3 -m py_compile tools/qemu/cpm86-qemu.py
+      - name: Build cpm86run
+        run: make -C tools/cpm86run
+      - name: Get clang
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset=$(gh api repos/clang-retro/llvm/releases/tags/llvm-prebuilt --jq \
+            '[.assets[] | select(.name | startswith("llvm-linux-"))] | sort_by(.created_at) | last | .name')
+          echo "Using $asset"
+          gh release download llvm-prebuilt -R clang-retro/llvm -p "$asset" -O llvm.tar.zst
+          mkdir -p "$RUNNER_TEMP/llvm"
+          tar --zstd -xf llvm.tar.zst -C "$RUNNER_TEMP/llvm"
+          rm llvm.tar.zst
+          bin=$RUNNER_TEMP/llvm/bin
+          echo "BIN=$bin" >> "$GITHUB_ENV"
+          sha=${asset#llvm-linux-}
+          echo "LLVM_SHA=${sha%%-*}" >> "$GITHUB_ENV"
+          if [ -x "$bin/llvm-exe2cmd" ] &&
+             "$bin/clang" --target=i8086-unknown-cpm -E -dM -x c /dev/null | grep -q __CPM86__; then
+            echo "HAVE_CPM=1" >> "$GITHUB_ENV"
+          else
+            echo "::warning::$asset has no i8086-unknown-cpm target or llvm-exe2cmd yet; skipping the tests"
+          fi
+      - name: Get compiler-rt's builtins
+        if: env.HAVE_CPM == '1'
+        uses: actions/checkout@v4
+        with:
+          repository: clang-retro/llvm
+          ref: ${{ env.LLVM_SHA }}
+          path: llvm
+          sparse-checkout: compiler-rt/lib/builtins
+          persist-credentials: false
+      - name: Get picolibc
+        if: env.HAVE_CPM == '1'
+        uses: actions/checkout@v4
+        with:
+          repository: clang-retro/picolibc
+          path: picolibc
+          persist-credentials: false
+      - name: Get JWlink
+        if: env.HAVE_CPM == '1'
+        uses: actions/checkout@v4
+        with:
+          repository: clang-retro/jwlink
+          path: jwlink
+          persist-credentials: false
+      - name: Build JWlink
+        if: env.HAVE_CPM == '1'
+        run: |
+          make -C jwlink -f GccUnix.mak -j"$(nproc)"
+          cp jwlink/build/jwlinkLR/jwlink "$BIN/"
+      - name: Build the sysroot
+        if: env.HAVE_CPM == '1'
+        run: |
+          pip install meson ninja
+          LLVM_SRC=$PWD/llvm PICOLIBC_SRC=$PWD/picolibc ./build-sysroot.sh "$RUNNER_TEMP/i8086-cpm"
+      - name: Tests
+        if: env.HAVE_CPM == '1'
+        run: SYSROOT=$RUNNER_TEMP/i8086-cpm tests/run-tests.sh
+      - name: Examples
+        if: env.HAVE_CPM == '1'
+        run: |
+          for f in examples/*.c; do
+            "$BIN/clang" --target=i8086-unknown-cpm --sysroot="$RUNNER_TEMP/i8086-cpm" \
+              -Os -Wall -Werror "$f" -o "$RUNNER_TEMP/$(basename "$f" .c).cmd"
+          done
