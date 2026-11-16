@@ -126,13 +126,16 @@ everything under [C programs](#c-programs) holds, with these differences:
   `time` reads the clock on CP/M 3 and MP/M (BDOS 105); CP/M 2.2 has none.
 - `<cpm.h>`'s `bdos(fn, de)` calls `0005h` with the function in C and the
   parameter in DE, and returns BA (HL).
-- `int` is 16 bits, `long` 32 and `long long` 64; `float` and `double` are
-  IEEE single and double, in software. The Z80 code uses IX as the frame
-  pointer; the 8080 code runs on the Z80 too.
-- Programs are big: a `printf("%d")` hello is about 17 KiB on the Z80, as
-  the compiler calls the integer printf when the format allows. Printing
-  `double`s with the full printf and `strtod` takes about 57 KiB on the
-  Z80, and does not fit in 64 KiB on the 8080 yet.
+- `int` is 16 bits, `long` 32 and `long long` 64. `float`, `double` and
+  `long double` are all IEEE single precision, in software, as in most
+  compilers for 8-bit processors: double precision is too big for a 64 KiB
+  machine. (`-mdouble=64` makes `double` IEEE double, but the sysroots'
+  library is built for 32-bit `double`.) BC and, on the Z80, IX (the frame
+  pointer) are kept across calls; the 8080 code runs on the Z80 too.
+- Sizes: a `puts` hello is about 7.5 KiB on the Z80 and 8.5 KiB on the
+  8080, a `printf("%d")` one about 13.5 and 16 KiB (the compiler calls the
+  integer printf when the format allows), and one that reads and prints
+  floating point with `atof` and `printf("%g")` about 40 and 49 KiB.
 
 [`tools/ntvcm`](tools/ntvcm) is David Lee's CP/M 2.2 emulator, with the
 Z80 and (`-8`) the 8080:
@@ -147,9 +150,31 @@ and the tests run in it on both processors:
 
 ## License
 
-The SDK is under the GNU Affero General Public License v3 or later
-([LICENSE](LICENSE)). The C library's CP/M-86 layer is in picolibc, under
-its BSD license. The 8086 emulator in `tools/cpm86run` is from
-[ntvdm](https://github.com/davidly/ntvdm), under CC0, `tools/ntvcm` is
-[ntvcm](https://github.com/davidly/ntvcm), under CC0, and
-`tools/qemu/chainboot.S` is CC0.
+Copyright (C) clang-retro contributors.
+
+The SDK is free software under the GNU Affero General Public License,
+version 3 only (`AGPL-3.0-only`), like the other clang-retro SDKs; the full
+text is in [LICENSE](LICENSE). These parts keep their own licenses:
+
+- `tools/cpm86run` comes from [ntvdm](https://github.com/davidly/ntvdm) and
+  `tools/ntvcm` from [ntvcm](https://github.com/davidly/ntvcm), both by
+  David Lee under CC0. `tools/qemu/chainboot.S` is CC0 too.
+- The C library's CP/M layers are in picolibc, under its BSD license.
+
+### Programs you build
+
+A program built with the SDK contains only the sysroot's libraries, none of
+the SDK's own code:
+
+- picolibc (`crt0`, `libc.a`): BSD-style licenses. If you ship a program in
+  binary form, include their notices in its documentation. The sysroot has
+  them in `share/licenses/COPYING.picolibc`.
+- the compiler-rt builtins: Apache-2.0 with the LLVM exception, which needs
+  no notice for compiled code (`share/licenses/compiler-rt-LICENSE.TXT`).
+
+So you may distribute your programs under any license you like, as long as
+you include picolibc's notices. The examples and tests here are under the
+AGPL, like the rest of the SDK; code you copy from them comes with it.
+
+CP/M itself is not part of the SDK. `tools/qemu/cpm86-qemu.py` downloads
+CP/M-86 1.1 when it runs, and ntvcm emulates the CP/M 2.2 BDOS itself.
