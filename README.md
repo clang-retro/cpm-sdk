@@ -126,13 +126,16 @@ everything under [C programs](#c-programs) holds, with these differences:
   `time` reads the clock on CP/M 3 and MP/M (BDOS 105); CP/M 2.2 has none.
 - `<cpm.h>`'s `bdos(fn, de)` calls `0005h` with the function in C and the
   parameter in DE, and returns BA (HL).
-- `int` is 16 bits, `long` 32 and `long long` 64; `float` and `double` are
-  IEEE single and double, in software. The Z80 code uses IX as the frame
-  pointer; the 8080 code runs on the Z80 too.
-- Programs are big: a `printf("%d")` hello is about 17 KiB on the Z80, as
-  the compiler calls the integer printf when the format allows. Printing
-  `double`s with the full printf and `strtod` takes about 57 KiB on the
-  Z80, and does not fit in 64 KiB on the 8080 yet.
+- `int` is 16 bits, `long` 32 and `long long` 64. `float`, `double` and
+  `long double` are all IEEE single precision, in software, as in most
+  compilers for 8-bit processors: double precision is too big for a 64 KiB
+  machine. (`-mdouble=64` makes `double` IEEE double, but the sysroots'
+  library is built for 32-bit `double`.) BC and, on the Z80, IX (the frame
+  pointer) are kept across calls; the 8080 code runs on the Z80 too.
+- Sizes: a `puts` hello is about 7.5 KiB on the Z80 and 8.5 KiB on the
+  8080, a `printf("%d")` one about 13.5 and 16 KiB (the compiler calls the
+  integer printf when the format allows), and one that reads and prints
+  floating point with `atof` and `printf("%g")` about 40 and 49 KiB.
 
 [`tools/ntvcm`](tools/ntvcm) is David Lee's CP/M 2.2 emulator, with the
 Z80 and (`-8`) the 8080:
