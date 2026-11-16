@@ -7,6 +7,11 @@
 /tests-out/
 /tools/cpm86run/cpm86run
 /tools/cpm86run/cpm86run.exe
+/tools/ntvcm/ntvcm
+/tools/ntvcm/ntvcm.exe
+/build-cpm80/
+*.com
+*.COM
 *.log
 __pycache__/
 *.cmd

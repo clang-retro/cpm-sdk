@@ -1,0 +1,6 @@
+argc 3
+argv[1] ONE
+argv[2] TWO
+-12345 54321 -1234567890 deadbeef -1234567890123456789
+00042|ab  |ff
+strtol -77
