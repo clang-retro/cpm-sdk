@@ -1,0 +1,6 @@
+version 0022
+_cpm_version 0022
+8080 model 1
+default FCB FILENAME
+print string
+cputs
